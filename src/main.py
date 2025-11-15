@@ -53,8 +53,8 @@ FEATURE_DIM = NUM_PLANES * BOARD_SIZE * BOARD_SIZE + 4
 
 MODEL = None
 DEVICE = "cuda"
-MODEL_PATH = os.path.join(ROOT_DIR, "model.pt")
-BEST_MODEL_PATH = os.path.join(ROOT_DIR, "model_best.pt")
+MODEL_PATH = os.path.join(ROOT_DIR,"weights", "model.pt")
+BEST_MODEL_PATH = os.path.join(ROOT_DIR, "weights", "model_best.pt")
 
 # ---------------------------
 # Stockfish config
