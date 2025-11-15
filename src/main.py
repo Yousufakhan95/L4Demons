@@ -1,22 +1,28 @@
 # ============================================================
-#  FULL CHESSHACKS BOT + TRAINING + UNIVERSAL DATA LOADER
-#  (GPU, negamax+alpha-beta, parallel PGN loading, replay buf,
-#   upgraded net, validation, LR scheduler, best-model saving)
+#  CNN-BASED CHESSHACKS BOT + TRAINING ENGINE (DYNAMIC DEPTH)
+#  - CNN value net over 8x8 planes
+#  - Negamax + alpha-beta + quiescence
+#  - Dynamic search depth for actual games
+#  - Supervised training from PGN/CSV with Elo weighting
+#  - Self-play + games vs Stockfish
+#  - Explicit backprop_step() for training (Ctrl-C to stop)
 # ============================================================
 
-from .utils import chess_manager, GameContext
+from .utils import chess_manager, GameContext  # adapt if your path is different
 from chess import Board, Move
 import chess
+import chess.engine
+import chess.pgn
 import random
 import math
 import os
 import csv
 import numpy as np
-from typing import Optional
+from typing import Optional, List, Tuple
 import concurrent.futures
 
 # ============================================================
-#  TRY TORCH — BUT BOT MUST WORK WITHOUT IT
+#  TORCH SETUP
 # ============================================================
 
 try:
@@ -32,27 +38,59 @@ except Exception as e:
     F = None
 
 # ============================================================
-#  CONSTANTS + ROOT
+#  CONSTANTS + PATHS
 # ============================================================
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))  # project root
+
 BOARD_SIZE = 8
 NUM_PIECE_PLANES = 12   # 6 piece types per color
 NUM_EXTRA_PLANES = 1    # side-to-move plane
-FEATURE_DIM = BOARD_SIZE * BOARD_SIZE * (NUM_PIECE_PLANES + NUM_EXTRA_PLANES) + 4
-# 4 castling flags (white/black castle rights)
+NUM_PLANES = NUM_PIECE_PLANES + NUM_EXTRA_PLANES
+
+# We keep 4 extra scalar features (castling rights) at the end of the vector
+FEATURE_DIM = NUM_PLANES * BOARD_SIZE * BOARD_SIZE + 4
 
 MODEL = None
 DEVICE = "cuda"
 MODEL_PATH = os.path.join(ROOT_DIR, "model.pt")
 BEST_MODEL_PATH = os.path.join(ROOT_DIR, "model_best.pt")
 
-# Search config
-SEARCH_DEPTH = 3          # main engine depth (root)
-SELFPLAY_DEPTH = 1        # depth used during self-play (keep small for speed)
+# ---------------------------
+# Stockfish config
+# ---------------------------
+STOCKFISH_PATH = os.path.join(ROOT_DIR, "engines", "stockfish.exe")
+STOCKFISH_TIME_LIMIT = 0.03  # seconds per move for training/eval
+STOCKFISH_MAX_MOVES = 200
 
+# Elo ladder config
+EVAL_ELOS = [1000]
+EVAL_GAMES_PER_LEVEL = 4
+EVAL_LADDER_INTERVAL_GAMES = 20  # run ladder every N self-play games
+
+# ---------------------------
+# Search config
+# ---------------------------
+# Base depth for online play (you can tweak this):
+BASE_SEARCH_DEPTH = 3          # starting point
+MIN_SEARCH_DEPTH = 2           # clamp
+MAX_SEARCH_DEPTH = 6           # clamp
+
+SELFPLAY_DEPTH = 2             # depth in self-play for speed
+TRAIN_SEARCH_DEPTH = 3         # depth vs Stockfish in training
+
+# ---------------------------
 # Data config
-MIN_FULLMOVES_FOR_PGN_LABEL = 10  # only label positions after move 10 to reduce early-game noise
+# ---------------------------
+MIN_FULLMOVES_FOR_PGN_LABEL = 10  # start labeling after move 10
+
+# ---------------------------
+# Elo weighting config
+# ---------------------------
+# Average Elo between players is mapped to a [0.1, 1.0] weight.
+# Below MIN_AVG_ELO_FOR_WEIGHT → use 0.1; above MAX → use 1.0.
+MIN_AVG_ELO_FOR_WEIGHT = 1400
+MAX_AVG_ELO_FOR_WEIGHT = 2400
 
 
 # ============================================================
@@ -60,26 +98,28 @@ MIN_FULLMOVES_FOR_PGN_LABEL = 10  # only label positions after move 10 to reduce
 # ============================================================
 
 def piece_plane_index(piece: chess.Piece) -> int:
-    # 0–5 white Pawn..King, 6–11 black Pawn..King
+    # 0–5 white pawn..king, 6–11 black pawn..king
     return (0 if piece.color else 6) + (piece.piece_type - 1)
 
 
 def board_to_tensor(board: chess.Board):
     """
     Encode board into a 1D tensor of size FEATURE_DIM.
-    Returns None if torch is not available.
+    Layout:
+      - First NUM_PLANES * 64 entries: 8x8 planes (piece planes + side-to-move)
+      - Last 4 entries: castling rights flags.
     """
     if not TORCH_AVAILABLE or torch is None:
         return None
 
-    planes = torch.zeros(NUM_PIECE_PLANES + NUM_EXTRA_PLANES, 8, 8, dtype=torch.float32)
+    planes = torch.zeros(NUM_PLANES, BOARD_SIZE, BOARD_SIZE, dtype=torch.float32)
 
     for square, piece in board.piece_map().items():
         rank = square // 8
         file = square % 8
         planes[piece_plane_index(piece), rank, file] = 1.0
 
-    # side to move plane
+    # side-to-move plane (all ones if white to move, zeros if black)
     planes[NUM_PIECE_PLANES, :, :] = 1.0 if board.turn else 0.0
 
     flat = planes.reshape(-1)
@@ -95,151 +135,112 @@ def board_to_tensor(board: chess.Board):
 
 
 # ============================================================
-#  MODEL
+#  CNN VALUE NETWORK
 # ============================================================
 
 if TORCH_AVAILABLE and nn is not None:
 
-    class ResidualBlock(nn.Module):
+    class CnnValueNet(nn.Module):
         """
-        Simple residual MLP block: x -> LN -> GELU -> Linear -> Dropout -> +x
-        No hand-crafted eval, just deeper non-linear function approximator.
+        CNN over board planes + small dense head with extra meta features.
+        Input: flat vector length FEATURE_DIM
+        Output: scalar value in [-1, 1] from White's POV for given board.
         """
-        def __init__(self, dim, dropout=0.2):
+        def __init__(self, input_dim: int, num_planes: int = NUM_PLANES):
             super().__init__()
-            self.norm = nn.LayerNorm(dim)
-            self.fc = nn.Linear(dim, dim)
-            self.dropout = nn.Dropout(dropout)
+            self.num_planes = num_planes
+            board_vec_dim = num_planes * BOARD_SIZE * BOARD_SIZE
+            self.board_vec_dim = board_vec_dim
+            self.meta_dim = input_dim - board_vec_dim  # should be 4
 
-        def forward(self, x):
-            residual = x
-            x = self.norm(x)
-            x = F.gelu(x)
-            x = self.fc(x)
-            x = self.dropout(x)
-            return x + residual
+            # Convolutional trunk over 8x8 planes
+            self.conv1 = nn.Conv2d(num_planes, 32, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+            self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
 
+            conv_output_dim = 64 * BOARD_SIZE * BOARD_SIZE  # 64 channels * 8 * 8
 
-    class SimpleValueNet(nn.Module):
-        """
-        Upgraded value net:
-          - Wider hidden layer
-          - Stack of residual blocks with LayerNorm + GELU
-          - Final projection to scalar in [-1, 1]
-        Input = flat FEATURE_DIM, output = scalar value.
-        """
-        def __init__(self, input_dim):
-            super().__init__()
-            hidden_dim = 1024
-            num_blocks = 4
+            self.fc1 = nn.Linear(conv_output_dim + self.meta_dim, 512)
+            self.fc2 = nn.Linear(512, 128)
+            self.fc_out = nn.Linear(128, 1)
+            self.dropout = nn.Dropout(0.2)
 
-            self.input_proj = nn.Linear(input_dim, hidden_dim)
-            self.blocks = nn.ModuleList(
-                [ResidualBlock(hidden_dim, dropout=0.2) for _ in range(num_blocks)]
-            )
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # x: [batch, FEATURE_DIM]
+            board_flat = x[:, :self.board_vec_dim]
+            meta = x[:, self.board_vec_dim:]  # [batch, meta_dim]
 
-            self.head_norm = nn.LayerNorm(hidden_dim)
-            self.head_fc1 = nn.Linear(hidden_dim, 256)
-            self.head_dropout = nn.Dropout(0.2)
-            self.head_fc2 = nn.Linear(256, 1)
+            board_planes = board_flat.view(-1, self.num_planes, BOARD_SIZE, BOARD_SIZE)
 
-        def forward(self, x):
-            x = self.input_proj(x)
-            for block in self.blocks:
-                x = block(x)
+            h = F.relu(self.conv1(board_planes))
+            h = F.relu(self.conv2(h))
+            h = F.relu(self.conv3(h))
 
-            x = self.head_norm(x)
-            x = F.gelu(x)
-            x = self.head_fc1(x)
-            x = F.gelu(x)
-            x = self.head_dropout(x)
-            x = self.head_fc2(x)
-            x = torch.tanh(x).squeeze(-1)   # [-1, 1]
-            return x
+            h = h.view(h.size(0), -1)
+            h = torch.cat([h, meta], dim=1)
+
+            h = F.relu(self.fc1(h))
+            h = self.dropout(h)
+            h = F.relu(self.fc2(h))
+            out = torch.tanh(self.fc_out(h)).squeeze(-1)
+            return out
 
 else:
-    SimpleValueNet = None
+    CnnValueNet = None
 
 
 def init_model():
     """
-    Init MODEL (from model.pt if present).
+    Init global MODEL (CNN) and load weights if model.pt exists.
     """
     global MODEL, DEVICE
-    if not TORCH_AVAILABLE or SimpleValueNet is None:
+
+    if not TORCH_AVAILABLE or CnnValueNet is None:
         MODEL = None
-        print("[ML] Torch not available, running without ML.")
+        print("[ML] Torch or CNN class not available, running without ML.")
         return
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[ML] Using device: {DEVICE}")
-    MODEL = SimpleValueNet(FEATURE_DIM).to(DEVICE)
+
+    MODEL = CnnValueNet(FEATURE_DIM).to(DEVICE)
 
     if os.path.exists(MODEL_PATH):
         try:
             state = torch.load(MODEL_PATH, map_location=DEVICE)
+            # Allow older formats that might wrap state dict
             if isinstance(state, dict) and "model_state_dict" in state:
-                # in case of older save formats
                 state = state["model_state_dict"]
             MODEL.load_state_dict(state)
             print(f"[ML] Loaded model from {MODEL_PATH}")
         except Exception as e:
-            print(f"[ML] Failed to load model.pt: {e}")
+            print(f"[ML] Failed to load model.pt, using fresh weights: {e}")
     else:
-        print("[ML] No model.pt found — using fresh weights.")
+        print("[ML] No model.pt found — starting from scratch.")
 
     MODEL.eval()
 
 
+# Initialize immediately so the dashboard can use the bot
 init_model()
 
 
 # ============================================================
-#  MOVE SELECTION HELPERS
+#  SIMPLE EVAL + NN-BASED EVAL
 # ============================================================
 
-def softmax(scores):
-    if not scores:
-        return []
-    m = max(scores)
-    exps = [math.exp(s - m) for s in scores]
-    total = sum(exps)
-    if total <= 0:
-        return [1.0 / len(scores)] * len(scores)
-    return [e / total for e in exps]
-
-
-# ============================================================
-#  CLASSICAL CHESS EVALUATION (MATERIAL + SIMPLE HEURISTICS)
-# ============================================================
-
-# Piece values in centipawns
+# Basic material values in centipawns
 PIECE_VALUES = {
     chess.PAWN:   100,
     chess.KNIGHT: 320,
     chess.BISHOP: 330,
     chess.ROOK:   500,
     chess.QUEEN:  900,
-    chess.KING:   0,    # king's "value" is handled via safety, not material
+    chess.KING:   0,  # king safety handled separately if needed
 }
 
-# Central squares for basic center control
-CENTER_SQUARES_STRONG = [
-    chess.D4, chess.E4, chess.D5, chess.E5
-]
-CENTER_SQUARES_EXTENDED = [
-    chess.C3, chess.D3, chess.E3, chess.F3,
-    chess.C4, chess.F4,
-    chess.C5, chess.F5,
-    chess.C6, chess.D6, chess.E6, chess.F6,
-]
 
-
-def material_score(board: chess.Board) -> int:
-    """
-    Material in centipawns from White's POV.
-    White pieces positive, Black pieces negative.
-    """
+def material_eval_cp(board: chess.Board) -> int:
     score = 0
     for square, piece in board.piece_map().items():
         val = PIECE_VALUES.get(piece.piece_type, 0)
@@ -250,274 +251,34 @@ def material_score(board: chess.Board) -> int:
     return score
 
 
-def piece_activity_score(board: chess.Board) -> int:
+def simple_classical_eval(board: chess.Board) -> float:
     """
-    Very simple activity / centralization heuristic for minor/major pieces.
-    Encourages knights/bishops/queens toward the center.
+    Very simple classical eval in [-1, 1], from side-to-move POV.
+    We mostly rely on CNN; this is just a stabilizer.
     """
-    score = 0
-    for square, piece in board.piece_map().items():
-        if piece.piece_type not in (chess.KNIGHT, chess.BISHOP, chess.QUEEN):
-            continue
+    cp = material_eval_cp(board)
 
-        file = chess.square_file(square)  # 0..7
-        rank = chess.square_rank(square)  # 0..7
+    # Normalize to [-1, 1] assuming ±2000cp extremes
+    MAX_CP = 2000.0
+    cp = max(-MAX_CP, min(MAX_CP, float(cp)))
+    val = cp / MAX_CP
 
-        # Distance from edge: more central = bigger bonus
-        dist_file = min(file, 7 - file)
-        dist_rank = min(rank, 7 - rank)
-        activity = dist_file + dist_rank  # max 6
-
-        bonus = activity * 2  # up to ~12 cp
-        if piece.color == chess.WHITE:
-            score += bonus
-        else:
-            score -= bonus
-
-    return score
-
-
-def center_control_score(board: chess.Board) -> int:
-    """
-    Reward occupying strong/extended center squares (very rough).
-    """
-    score = 0
-    for sq in CENTER_SQUARES_STRONG:
-        piece = board.piece_at(sq)
-        if piece is None:
-            continue
-        bonus = 15  # strong center
-        if piece.piece_type == chess.PAWN:
-            bonus += 10  # central pawns are huge
-
-        if piece.color == chess.WHITE:
-            score += bonus
-        else:
-            score -= bonus
-
-    for sq in CENTER_SQUARES_EXTENDED:
-        piece = board.piece_at(sq)
-        if piece is None:
-            continue
-        bonus = 8
-        if piece.piece_type == chess.PAWN:
-            bonus += 6
-
-        if piece.color == chess.WHITE:
-            score += bonus
-        else:
-            score -= bonus
-
-    return score
-
-
-def development_score(board: chess.Board) -> int:
-    """
-    Very crude development heuristic:
-      - Penalize knights/bishops still on their original squares
-      - Reward castling
-      - Penalize staying uncastled in the center after move 10
-    """
-    score = 0
-    fullmove = board.fullmove_number
-
-    # --- White undeveloped minors ---
-    piece_b1 = board.piece_at(chess.B1)
-    if piece_b1 is not None and piece_b1.color == chess.WHITE and piece_b1.piece_type == chess.KNIGHT:
-        score -= 12
-
-    piece_g1 = board.piece_at(chess.G1)
-    if piece_g1 is not None and piece_g1.color == chess.WHITE and piece_g1.piece_type == chess.KNIGHT:
-        score -= 12
-
-    piece_c1 = board.piece_at(chess.C1)
-    if piece_c1 is not None and piece_c1.color == chess.WHITE and piece_c1.piece_type == chess.BISHOP:
-        score -= 10
-
-    piece_f1 = board.piece_at(chess.F1)
-    if piece_f1 is not None and piece_f1.color == chess.WHITE and piece_f1.piece_type == chess.BISHOP:
-        score -= 10
-
-    # --- Black undeveloped minors ---
-    piece_b8 = board.piece_at(chess.B8)
-    if piece_b8 is not None and piece_b8.color == chess.BLACK and piece_b8.piece_type == chess.KNIGHT:
-        score += 12  # from White POV, black undeveloped is good for White
-
-    piece_g8 = board.piece_at(chess.G8)
-    if piece_g8 is not None and piece_g8.color == chess.BLACK and piece_g8.piece_type == chess.KNIGHT:
-        score += 12
-
-    piece_c8 = board.piece_at(chess.C8)
-    if piece_c8 is not None and piece_c8.color == chess.BLACK and piece_c8.piece_type == chess.BISHOP:
-        score += 10
-
-    piece_f8 = board.piece_at(chess.F8)
-    if piece_f8 is not None and piece_f8.color == chess.BLACK and piece_f8.piece_type == chess.BISHOP:
-        score += 10
-
-    # --- Castling / king in center ---
-    wk_sq = board.king(chess.WHITE)
-    bk_sq = board.king(chess.BLACK)
-
-    # White king castled
-    if wk_sq in (chess.G1, chess.C1):
-        score += 20
-    # Black king castled
-    if bk_sq in (chess.G8, chess.C8):
-        score -= 20
-
-    # If we’re past move 10 and kings are still in the center, penalize that
-    if fullmove >= 10:
-        if wk_sq in (chess.E1, chess.D1):
-            score -= 20
-        if bk_sq in (chess.E8, chess.D8):
-            score += 20
-
-    return score
-
-
-def king_safety_score(board: chess.Board) -> int:
-    """
-    Tiny king safety heuristic:
-      - Reward having pawn shield in front of castled king
-      - Penalize wide-open king files next to it
-    """
-    score = 0
-    wk_sq = board.king(chess.WHITE)
-    bk_sq = board.king(chess.BLACK)
-
-    # White king typical castled square
-    if wk_sq == chess.G1:
-        # pawns f2, g2, h2 as shield
-        for sq in (chess.F2, chess.G2, chess.H2):
-            p = board.piece_at(sq)
-            if p is not None and p.color == chess.WHITE and p.piece_type == chess.PAWN:
-                score += 4
-            else:
-                score -= 3  # weak spot
-
-    # Black king typical castled square
-    if bk_sq == chess.G8:
-        for sq in (chess.F7, chess.G7, chess.H7):
-            p = board.piece_at(sq)
-            if p is not None and p.color == chess.BLACK and p.piece_type == chess.PAWN:
-                score -= 4  # good for Black = bad for White
-            else:
-                score += 3
-
-    return score
-
-
-def early_pawn_weirdness_score(board: chess.Board) -> int:
-    """
-    Penalize dumb early pawn moves:
-      - Big penalty for pushing the f-pawn too far while king is in the center.
-      - Smaller penalty for randomly advancing flank pawns in the opening.
-    Returns score in centipawns from White's POV.
-    """
-    fullmove = board.fullmove_number
-    if fullmove > 10:
-        return 0  # only care in the opening
-
-    score = 0
-
-    # ----- f-pawn penalties -----
-    F_PAWN_PENALTY_CP = 40   # 0.4 pawn
-    FLANK_PAWN_PENALTY_CP = 15
-
-    piece_map = board.piece_map()
-
-    # White f-pawn
-    white_f_pawn_square = None
-    for sq, pc in piece_map.items():
-        if pc.color and pc.piece_type == chess.PAWN and chess.square_file(sq) == chess.FILE_F:
-            white_f_pawn_square = sq
-            break
-
-    if white_f_pawn_square is not None:
-        rank = chess.square_rank(white_f_pawn_square)  # 0=rank1, ..., 7=rank8
-        # if pawn is beyond f3 (rank >= 3) while king still on e1 -> bad
-        if rank >= 3 and board.king(chess.WHITE) == chess.E1:
-            score -= F_PAWN_PENALTY_CP
-
-    # Black f-pawn
-    black_f_pawn_square = None
-    for sq, pc in piece_map.items():
-        if (not pc.color) and pc.piece_type == chess.PAWN and chess.square_file(sq) == chess.FILE_F:
-            black_f_pawn_square = sq
-            break
-
-    if black_f_pawn_square is not None:
-        rank = chess.square_rank(black_f_pawn_square)
-        # from White POV, if black f-pawn is advanced (rank <= 4) with king on e8, that's good
-        if rank <= 4 and board.king(chess.BLACK) == chess.E8:
-            score += F_PAWN_PENALTY_CP
-
-    # ----- flank pawns (a, b, g, h) randomly pushed -----
-    for sq, pc in piece_map.items():
-        if pc.piece_type != chess.PAWN:
-            continue
-        file_idx = chess.square_file(sq)
-        rank_idx = chess.square_rank(sq)
-
-        if file_idx in (chess.FILE_A, chess.FILE_B, chess.FILE_G, chess.FILE_H):
-            # White flank pawns advanced beyond rank 2
-            if pc.color and rank_idx > 1:
-                score -= FLANK_PAWN_PENALTY_CP
-            # Black flank pawns advanced beyond rank 7 (toward White side)
-            if (not pc.color) and rank_idx < 6:
-                score += FLANK_PAWN_PENALTY_CP
-
-    return score
-
-
-def classical_eval(board: chess.Board) -> float:
-    """
-    Classical evaluation from POV of side-to-move in [-1, 1].
-    Combines:
-      - material
-      - piece activity / centralization
-      - center control (occupancy)
-      - development
-      - king safety
-      - early pawn weirdness (f-pawn / flanks)
-    """
-    # All these scores are "White minus Black" in centipawns
-    score_cp = 0
-    score_cp += material_score(board)
-    score_cp += piece_activity_score(board)
-    score_cp += center_control_score(board)
-    score_cp += development_score(board)
-    score_cp += king_safety_score(board)
-    score_cp += early_pawn_weirdness_score(board)
-
-    # Clamp and normalize to [-1, 1]
-    MAX_CP = 2000.0  # ~20 pawns equivalent; very generous
-    if score_cp > MAX_CP:
-        score_cp = MAX_CP
-    elif score_cp < -MAX_CP:
-        score_cp = -MAX_CP
-
-    value = score_cp / MAX_CP  # now in roughly [-1, 1]
-
-    # Convert to side-to-move POV
+    # side-to-move POV
     if board.turn == chess.WHITE:
-        return float(value)
+        return val
     else:
-        return float(-value)
+        return -val
 
 
 def evaluate_position(board: chess.Board) -> float:
     """
-    Final evaluation from POV of side to move.
+    Final evaluation from POV of side to move, in [-1, 1].
 
-    Combines:
-      - classical_eval(board): basic chess heuristics
-      - NN value (if available): learned evaluation
-
-    Both are in [-1, 1], then blended.
+    Combination:
+      - light classical eval
+      - CNN value net (stronger pattern recognition)
     """
-    classical = classical_eval(board)
+    classical = simple_classical_eval(board)
 
     if not TORCH_AVAILABLE or MODEL is None:
         return classical
@@ -528,34 +289,123 @@ def evaluate_position(board: chess.Board) -> float:
 
     with torch.no_grad():
         x = x.to(DEVICE).unsqueeze(0)
-        v = MODEL(x)[0].item()
+        v = MODEL(x)[0].item()  # NN output in [-1, 1]
 
-    # Make hand-crafted chess knowledge dominate more
-    ALPHA = 0.7  # classical weight
-    BETA = 0.3   # NN weight
+    # Blend weights. You can tune these.
+    ALPHA = 0.2  # classical
+    BETA = 0.8   # CNN
 
-    combined = ALPHA * classical + BETA * float(v)
-    return combined
+    return ALPHA * classical + BETA * v
 
 
 # ============================================================
-#  NEGAMAX + ALPHA-BETA SEARCH
+#  DYNAMIC DEPTH FOR ACTUAL GAMES
 # ============================================================
+
+def estimate_material_phase(board: chess.Board) -> float:
+    """
+    Rough material count in "pawns" for both sides combined.
+    Used to guess opening / middlegame / endgame.
+    """
+    total_cp = 0
+    for _, piece in board.piece_map().items():
+        total_cp += PIECE_VALUES.get(piece.piece_type, 0)
+    # pawns-equivalent
+    return total_cp / 100.0
+
+
+def get_dynamic_depth(board: chess.Board) -> int:
+    """
+    Dynamic depth for actual dashboard games.
+
+    Heuristics:
+      - Start from BASE_SEARCH_DEPTH
+      - Increase depth in:
+          * Endgames (low material)
+          * Later in the game (fullmove_number big)
+          * When side to move is in check (tactical)
+      - Clamp between MIN_SEARCH_DEPTH and MAX_SEARCH_DEPTH
+    """
+    depth = BASE_SEARCH_DEPTH
+
+    phase_pawns = estimate_material_phase(board)  # ~32 at start
+    moves = board.fullmove_number
+    in_check = board.is_check()
+
+    # Later game or low material → think deeper
+    if moves >= 25 or phase_pawns <= 18:
+        depth += 1
+    if moves >= 40 or phase_pawns <= 12:
+        depth += 1
+
+    # If the side to move is in check, push a little deeper
+    if in_check:
+        depth += 1
+
+    # Clamp
+    depth = max(MIN_SEARCH_DEPTH, min(MAX_SEARCH_DEPTH, depth))
+    return depth
+
+
+# ============================================================
+#  NEGAMAX + ALPHA-BETA + QUIESCENCE
+# ============================================================
+
+def softmax(scores: List[float]) -> List[float]:
+    if not scores:
+        return []
+    m = max(scores)
+    exps = [math.exp(s - m) for s in scores]
+    total = sum(exps)
+    if total <= 0:
+        return [1.0 / len(scores)] * len(scores)
+    return [e / total for e in exps]
+
+
+def quiescence(board: chess.Board, alpha: float, beta: float, depth_cap: int = 4) -> float:
+    """
+    Very small quiescence search:
+      - Only explore capture moves (and promotions)
+      - Limit depth to avoid explosion.
+    """
+    stand_pat = evaluate_position(board)
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
+
+    if depth_cap <= 0:
+        return alpha
+
+    for move in board.generate_legal_moves():
+        if not board.is_capture(move) and not move.promotion:
+            continue
+        board.push(move)
+        score = -quiescence(board, -beta, -alpha, depth_cap - 1)
+        board.pop()
+
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
 
 def negamax(board: chess.Board, depth: int, alpha: float, beta: float) -> float:
     """
-    Negamax search with alpha-beta pruning.
-    Assumes evaluate_position(board) returns value from POV of side to move.
+    Negamax with alpha-beta pruning and quiescence at leaf nodes.
     """
-    # Base case: leaf node or game over
     if depth == 0 or board.is_game_over():
-        return evaluate_position(board)
+        return quiescence(board, alpha, beta)
 
     max_eval = -float("inf")
+    legal_moves = list(board.generate_legal_moves())
+    # Optional: simple move ordering (captures first)
+    legal_moves.sort(key=lambda m: board.is_capture(m), reverse=True)
 
-    for move in board.generate_legal_moves():
+    for move in legal_moves:
         board.push(move)
-        # Opponent to move in child, so negate value
         eval_score = -negamax(board, depth - 1, -beta, -alpha)
         board.pop()
 
@@ -577,35 +427,22 @@ def choose_move_with_search(
 ):
     """
     Use negamax + alpha-beta to pick the best move.
-    If depth is None, uses global SEARCH_DEPTH.
-    """
-    if depth is None:
-        depth = SEARCH_DEPTH
 
+    If depth is None:
+      - For *actual games* (dashboard), we call this with depth=None and
+        dynamically compute depth with get_dynamic_depth(board).
+    """
     if not legal_moves:
         return None, {}
 
-    # If NN not available, use classical_eval in a 1-ply search
+    # If no NN available, fall back to random
     if not TORCH_AVAILABLE or MODEL is None:
-        scores = []
-        best_score = -float("inf")
-        best_move = None
+        n = len(legal_moves)
+        return random.choice(legal_moves), {m: 1.0 / n for m in legal_moves}
 
-        for move in legal_moves:
-            board.push(move)
-            s = classical_eval(board)
-            board.pop()
-            scores.append(s)
+    if depth is None:
+        depth = get_dynamic_depth(board)
 
-            if s > best_score or best_move is None:
-                best_score = s
-                best_move = move
-
-        probs = softmax(scores)
-        prob_map = {m: p for m, p in zip(legal_moves, probs)}
-        return best_move, prob_map
-
-    # Normal NN+classical search
     best_score = -float("inf")
     best_move = None
     scores = []
@@ -616,7 +453,7 @@ def choose_move_with_search(
         board.pop()
 
         scores.append(score)
-        if score > best_score or best_move is None:
+        if best_move is None or score > best_score:
             best_score = score
             best_move = move
 
@@ -625,55 +462,25 @@ def choose_move_with_search(
     return best_move, prob_map
 
 
-def choose_move_ml(board: chess.Board, legal_moves, temperature: Optional[float] = 1.0):
-    """
-    Use eval (classical + NN) to pick a move via 1-ply evaluation.
-    - If temperature is None or <= 0 -> pure greedy (argmax on eval).
-    - If temperature > 0 -> sample from softmax(scores / temperature).
-    """
-    if not legal_moves:
-        return None, {}
-
-    scores = []
-    for move in legal_moves:
-        board.push(move)
-        s = evaluate_position(board)
-        board.pop()
-        scores.append(s)
-
-    # Greedy / deterministic mode
-    if temperature is None or temperature <= 0:
-        best_idx = max(range(len(scores)), key=lambda i: scores[i])
-        best_move = legal_moves[best_idx]
-        prob_map = {m: 0.0 for m in legal_moves}
-        prob_map[best_move] = 1.0
-        return best_move, prob_map
-
-    if temperature != 1.0:
-        scores = [s / temperature for s in scores]
-
-    probs = softmax(scores)
-    move = random.choices(legal_moves, weights=probs, k=1)[0]
-    prob_map = {m: p for m, p in zip(legal_moves, probs)}
-    return move, prob_map
-
-
 # ============================================================
-#  CHESSHACKS ENTRYPOINTS
+#  CHESSHACKS ENTRYPOINTS (ACTUAL GAMES)
 # ============================================================
 
 @chess_manager.entrypoint
 def test_func(ctx: GameContext):
     """
     Called for every move request by ChessHacks.
-    Uses negamax + alpha-beta for stronger play (NN + classical eval).
+
+    - Uses dynamic depth for search (get_dynamic_depth).
+    - Depth scales with phase of game + checks.
     """
     legal_moves = list(ctx.board.generate_legal_moves())
     if not legal_moves:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available.")
 
-    move, prob_map = choose_move_with_search(ctx.board, legal_moves, depth=SEARCH_DEPTH)
+    # depth=None → use dynamic depth
+    move, prob_map = choose_move_with_search(ctx.board, legal_moves, depth=None)
     ctx.logProbabilities(prob_map)
     return move
 
@@ -687,16 +494,49 @@ def reset_func(ctx: GameContext):
 
 
 # ============================================================
-#  RESULT → VALUE HELPERS
+#  ELO WEIGHT HELPER
+# ============================================================
+
+def elo_str_to_int(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def compute_elo_weight(avg_elo: Optional[float]) -> float:
+    """
+    Map average Elo to a weight in [0.1, 1.0].
+    - If Elo is unknown → 1.0
+    - Below MIN_AVG_ELO_FOR_WEIGHT → 0.1
+    - Above MAX_AVG_ELO_FOR_WEIGHT → 1.0
+    - Linear in between.
+    """
+    if avg_elo is None:
+        return 1.0
+
+    lo = MIN_AVG_ELO_FOR_WEIGHT
+    hi = MAX_AVG_ELO_FOR_WEIGHT
+
+    if avg_elo <= lo:
+        return 0.1
+    if avg_elo >= hi:
+        return 1.0
+
+    t = (avg_elo - lo) / (hi - lo)  # 0..1
+    return 0.1 + 0.9 * t
+
+
+# ============================================================
+#  PGN / CSV DATA LOADERS (SUPERVISED TRAINING, ELO-WEIGHTED)
 # ============================================================
 
 def game_result_to_value(result: str) -> float:
-    """
-    Convert PGN result string to value from White's POV:
-      "1-0"   -> +1
-      "0-1"   -> -1
-      "1/2-1/2" or anything else -> 0
-    """
     if result == "1-0":
         return 1.0
     elif result == "0-1":
@@ -705,31 +545,18 @@ def game_result_to_value(result: str) -> float:
         return 0.0
 
 
-# ============================================================
-#  PGN DATA LOADER
-# ============================================================
-
-def load_pgn_dataset(path, max_positions=None):
+def load_pgn_dataset(path: str, max_positions: Optional[int] = None):
     """
-    Load PGN file: for each game, assign a value from the POV of
-    the *side to move* in each position.
-
-    Rules:
-      - If the game is a decisive result:
-          value = +1.0  if side-to-move eventually wins
-                  -1.0  if side-to-move eventually loses
-      - If the game is a draw or has no standard result:
-          value = 0.0
-      - To reduce noisy opening labels, we only start collecting
-        after MIN_FULLMOVES_FOR_PGN_LABEL.
+    Load PGN file and generate (x, y, w) triples:
+      - x = feature tensor
+      - y = value from POV of side-to-move in that position
+      - w = sample weight based on average Elo of players
     """
     if not TORCH_AVAILABLE or torch is None:
         return []
 
-    import chess.pgn
-
     basename = os.path.basename(path)
-    print(f"[DATA] Starting PGN load: {basename}")
+    print(f"[DATA] Loading PGN: {basename}")
     positions = []
     game_count = 0
 
@@ -738,22 +565,42 @@ def load_pgn_dataset(path, max_positions=None):
             game = chess.pgn.read_game(f)
             if game is None:
                 break
-
             game_count += 1
 
-            result = game.headers.get("Result", "*")
+            headers = game.headers
+
+            # Try to fetch Elo from typical PGN tags
+            w_elo = (
+                elo_str_to_int(headers.get("WhiteElo"))
+                or elo_str_to_int(headers.get("WhiteRating"))
+            )
+            b_elo = (
+                elo_str_to_int(headers.get("BlackElo"))
+                or elo_str_to_int(headers.get("BlackRating"))
+            )
+
+            avg_elo = None
+            if w_elo is not None and b_elo is not None:
+                avg_elo = (w_elo + b_elo) / 2.0
+            elif w_elo is not None:
+                avg_elo = w_elo
+            elif b_elo is not None:
+                avg_elo = b_elo
+
+            sample_weight = compute_elo_weight(avg_elo)
+
+            result = headers.get("Result", "*")
             if result == "1-0":
                 winner_color = chess.WHITE
             elif result == "0-1":
                 winner_color = chess.BLACK
             else:
-                winner_color = None  # treat as draw/unknown -> 0.0
+                winner_color = None  # draw or unknown
 
             board = game.board()
             for mv in game.mainline_moves():
                 board.push(mv)
 
-                # Skip very early opening moves (result mostly uncorrelated)
                 if board.fullmove_number < MIN_FULLMOVES_FOR_PGN_LABEL:
                     continue
 
@@ -761,64 +608,69 @@ def load_pgn_dataset(path, max_positions=None):
                 if x is None:
                     continue
 
-                # Value from POV of *current* side to move
                 if winner_color is None:
                     val = 0.0
                 else:
-                    # If side to move is the eventual winner -> +1, else -1
                     val = 1.0 if board.turn == winner_color else -1.0
 
-                positions.append((x, val))
+                positions.append((x, val, sample_weight))
 
-                if max_positions and len(positions) >= max_positions:
-                    print(
-                        f"[DATA] Finished PGN {basename}: "
-                        f"{game_count} games, {len(positions)} positions (truncated)."
-                    )
+                if max_positions is not None and len(positions) >= max_positions:
+                    print(f"[DATA] PGN {basename}: {len(positions)} positions (truncated).")
                     return positions
 
-    print(f"[DATA] Finished PGN {basename}: {game_count} games, {len(positions)} positions.")
+    print(f"[DATA] PGN {basename}: {game_count} games, {len(positions)} positions.")
     return positions
 
 
-# ============================================================
-#  LICHESS GAMES CSV LOADER
-# ============================================================
-
-def load_lichess_games_csv(path, max_positions=None):
+def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
     """
-    Load a Lichess games CSV like:
-      id,rated,created_at,...,winner,...,moves,...
+    Load a Lichess games CSV with columns including:
+      id, winner, moves, white_elo / black_elo or similar.
 
-    For each game:
-      - Determine winner_color from 'winner' column.
-      - Replay moves using SAN.
-      - After each move (optionally skipping early moves), store
-        (features, value) where:
-
-          value = +1.0 if side-to-move eventually wins
-                  -1.0 if side-to-move eventually loses
-                   0.0 for draws/unknown
+    Outputs (x, y, w) triples with Elo-based weights.
     """
     if not TORCH_AVAILABLE or torch is None:
         print("[DATA] Torch not available; cannot load Lichess CSV.")
         return []
 
-    positions = []
     basename = os.path.basename(path)
-    print(f"[DATA] Starting Lichess CSV load: {basename}")
+    print(f"[DATA] Loading Lichess CSV: {basename}")
+    positions = []
 
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # winner
             winner = row.get("winner", "").strip().lower()
-
             if winner == "white":
                 winner_color = chess.WHITE
             elif winner == "black":
                 winner_color = chess.BLACK
             else:
-                winner_color = None  # draw/unknown
+                winner_color = None
+
+            # Try a few common rating column names
+            w_elo = (
+                elo_str_to_int(row.get("white_elo"))
+                or elo_str_to_int(row.get("white_rating"))
+                or elo_str_to_int(row.get("whiteelo"))
+            )
+            b_elo = (
+                elo_str_to_int(row.get("black_elo"))
+                or elo_str_to_int(row.get("black_rating"))
+                or elo_str_to_int(row.get("blackelo"))
+            )
+
+            avg_elo = None
+            if w_elo is not None and b_elo is not None:
+                avg_elo = (w_elo + b_elo) / 2.0
+            elif w_elo is not None:
+                avg_elo = w_elo
+            elif b_elo is not None:
+                avg_elo = b_elo
+
+            sample_weight = compute_elo_weight(avg_elo)
 
             moves_str = row.get("moves", "")
             if not moves_str:
@@ -826,13 +678,11 @@ def load_lichess_games_csv(path, max_positions=None):
 
             board = chess.Board()
             moves = moves_str.split()
-
             for mv in moves:
                 try:
                     board.push_san(mv)
                 except ValueError:
-                    # Invalid SAN -> bail out of this game
-                    break
+                    break  # invalid SAN -> skip game
 
                 if board.fullmove_number < MIN_FULLMOVES_FOR_PGN_LABEL:
                     continue
@@ -846,34 +696,27 @@ def load_lichess_games_csv(path, max_positions=None):
                 else:
                     val = 1.0 if board.turn == winner_color else -1.0
 
-                positions.append((x, val))
+                positions.append((x, val, sample_weight))
 
-                if max_positions and len(positions) >= max_positions:
-                    print(
-                        f"[DATA] Lichess CSV {basename} -> "
-                        f"{len(positions)} positions (truncated)."
-                    )
+                if max_positions is not None and len(positions) >= max_positions:
+                    print(f"[DATA] CSV {basename}: {len(positions)} positions (truncated).")
                     return positions
 
-    print(f"[DATA] Lichess CSV {basename} -> {len(positions)} positions.")
+    print(f"[DATA] CSV {basename}: {len(positions)} positions.")
     return positions
 
 
-# ============================================================
-#  UNIVERSAL DATASET LOADER (LOAD EVERYTHING IN datasets/)
-#  + CACHING
-# ============================================================
-
-def load_all_datasets(folder="datasets", max_positions=None):
+def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = None):
     """
-    Loads all datasets in a folder:
-      - .pgn     -> PGN games (loaded in parallel per file)
-      - .pt/.pth -> torch-saved tensors
-      - .npz     -> x,y arrays
-      - .csv     -> either Lichess games CSV or generic FEN/features CSV
-
-    Returns a list of (features_tensor, value).
+    Load everything in datasets folder:
+      - *.pgn -> PGN games
+      - lichess-style *.csv -> moves/winner
+    Returns list of (x, y, weight).
     """
+    if not TORCH_AVAILABLE:
+        print("[DATA] Torch not available; skipping dataset loading.")
+        return []
+
     if not os.path.isabs(folder):
         folder = os.path.join(ROOT_DIR, folder)
 
@@ -881,251 +724,222 @@ def load_all_datasets(folder="datasets", max_positions=None):
         print(f"[DATA] No dataset folder: {folder}")
         return []
 
-    # ---------- CACHE CHECK ----------
-    cache_path = os.path.join(folder, "cached_dataset.pt")
-    if TORCH_AVAILABLE and os.path.exists(cache_path):
-        print(f"[DATA] Loading cached dataset from {cache_path}")
-        try:
-            data = torch.load(cache_path, map_location="cpu")
-            xs = torch.tensor(data["x"], dtype=torch.float32)
-            ys = torch.tensor(data["y"], dtype=torch.float32)
-            positions = list(zip(xs, ys))
-            if max_positions is not None and len(positions) > max_positions:
-                positions = positions[:max_positions]
-            print(f"[DATA] Loaded {len(positions)} cached positions.")
-            return positions
-        except Exception as e:
-            print(f"[DATA] Failed to load cached dataset: {e}")
-    # -------------------------------
-
     files = os.listdir(folder)
-    all_pos = []
-
-    print(f"[DATA] Files in {folder}: {files}")
-
-    # ---------- PARALLEL PGN LOADING WITH PROGRESS ----------
     pgn_files = [f for f in files if f.lower().endswith(".pgn")]
-    other_files = [f for f in files if f not in pgn_files]
+    csv_files = [f for f in files if f.lower().endswith(".csv")]
 
+    all_positions: List[Tuple[torch.Tensor, float, float]] = []
+
+    # Parallel PGN loading
     if pgn_files:
-        print(f"[DATA] Loading {len(pgn_files)} PGN files in parallel...")
-
-        total_pgn = len(pgn_files)
+        print(f"[DATA] Parallel loading {len(pgn_files)} PGN files...")
+        total = len(pgn_files)
         completed = 0
 
         if max_positions is not None:
-            per_file_limit = max(1, max_positions // total_pgn)
+            per_file_limit = max(1, max_positions // max(total, 1))
         else:
             per_file_limit = None
 
         with concurrent.futures.ThreadPoolExecutor() as ex:
             futures = {}
-            for file in pgn_files:
-                path = os.path.join(folder, file)
-                print(f"[DATA] Scheduling PGN: {file}")
-                futures[ex.submit(load_pgn_dataset, path, per_file_limit)] = file
+            for f_name in pgn_files:
+                path = os.path.join(folder, f_name)
+                futures[ex.submit(load_pgn_dataset, path, per_file_limit)] = f_name
 
             for fut in concurrent.futures.as_completed(futures):
-                file = futures[fut]
+                fname = futures[fut]
                 try:
-                    positions = fut.result()
-                    all_pos.extend(positions)
-                    print(f"[DATA] PGN {file} -> {len(positions)} positions")
+                    pos = fut.result()
+                    all_positions.extend(pos)
+                    print(f"[DATA] PGN {fname}: {len(pos)} positions")
                 except Exception as e:
-                    print(f"[DATA] Failed to load PGN {file} in parallel: {e}")
+                    print(f"[DATA] Failed to load PGN {fname}: {e}")
 
                 completed += 1
-                progress = (completed / total_pgn) * 100.0
-                print(f"[DATA] PGN progress: {progress:.1f}% ({completed}/{total_pgn})")
+                print(f"[DATA] PGN progress: {completed}/{total}")
 
-                if max_positions is not None and len(all_pos) >= max_positions:
-                    all_pos = all_pos[:max_positions]
+                if max_positions is not None and len(all_positions) >= max_positions:
+                    all_positions = all_positions[:max_positions]
                     print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
-                    other_files = []
+                    csv_files = []
                     break
-    # -------------------------------------------------------
 
-    # ---------- OTHER FILE TYPES (SEQUENTIAL) ----------
-    for file in other_files:
-        path = os.path.join(folder, file)
-        name = file.lower()
-
-        # -------- PT / PTH --------
-        if (name.endswith(".pt") or name.endswith(".pth")) and TORCH_AVAILABLE and file != "cached_dataset.pt":
-            print(f"[DATA] Loading PT: {file}")
-            try:
-                data = torch.load(path, map_location="cpu")
-                if isinstance(data, list):
-                    all_pos.extend(data)
-                elif isinstance(data, dict) and "x" in data:
-                    xs = torch.tensor(data["x"], dtype=torch.float32)
-                    ys = torch.tensor(data["y"], dtype=torch.float32)
-                    for x, y in zip(xs, ys):
-                        all_pos.append((x, float(y)))
-                else:
-                    print(f"[DATA] Unrecognized PT format in {file}")
-            except Exception as e:
-                print(f"[DATA] Failed to load PT {file}: {e}")
-
-        # -------- NPZ --------
-        elif name.endswith(".npz") and TORCH_AVAILABLE:
-            print(f"[DATA] Loading NPZ: {file}")
-            try:
-                npz = np.load(path)
-                xs = torch.tensor(npz["x"], dtype=torch.float32)
-                ys = torch.tensor(npz["y"], dtype=torch.float32)
-                for x, y in zip(xs, ys):
-                    all_pos.append((x, float(y)))
-            except Exception as e:
-                print(f"[DATA] Failed to load NPZ {file}: {e}")
-
-        # -------- CSV --------
-        elif name.endswith(".csv"):
-            print(f"[DATA] Loading CSV: {file}")
-
-            with open(path, encoding="utf-8") as f:
-                header_line = f.readline().lower()
-
-            if "moves" in header_line and "winner" in header_line and "id" in header_line:
-                positions = load_lichess_games_csv(path, max_positions)
-                all_pos.extend(positions)
-            else:
-                with open(path, encoding="utf-8") as f2:
-                    reader = csv.reader(f2)
-                    for row in reader:
-                        if not row:
-                            continue
-
-                        # CASE 1: FEN,VALUE
-                        if "/" in row[0] and len(row) >= 2:
-                            fen = row[0]
-                            val_str = row[-1]
-                            try:
-                                val = float(val_str)
-                                b = chess.Board(fen)
-                                x = board_to_tensor(b)
-                                if x is not None:
-                                    all_pos.append((x, val))
-                            except Exception:
-                                continue
-                            continue
-
-                        # CASE 2: numeric feature1..N + value
-                        *feat, val_str = row
-                        try:
-                            val = float(val_str)
-                        except ValueError:
-                            continue
-
-                        feat_floats = []
-                        ok = True
-                        for v in feat:
-                            try:
-                                feat_floats.append(float(v))
-                            except ValueError:
-                                ok = False
-                                break
-
-                        if not ok or not feat_floats:
-                            continue
-
-                        x = torch.tensor(feat_floats, dtype=torch.float32)
-                        all_pos.append((x, val))
-
-        else:
-            print(f"[DATA] Skipping {file}")
-
-        if max_positions is not None and len(all_pos) >= max_positions:
-            print(f"[DATA] Reached max_positions={max_positions}")
+    # CSV loading
+    for f_name in csv_files:
+        path = os.path.join(folder, f_name)
+        pos = load_lichess_games_csv(path, max_positions)
+        all_positions.extend(pos)
+        if max_positions is not None and len(all_positions) >= max_positions:
+            all_positions = all_positions[:max_positions]
             break
-    # ---------------------------------------------------
 
-    if max_positions is not None and len(all_pos) > max_positions:
-        all_pos = all_pos[:max_positions]
-
-    print(f"[DATA] Loaded {len(all_pos)} positions total.")
-
-    # ---------- WRITE CACHE (SAFE) ----------
-    if TORCH_AVAILABLE and len(all_pos) > 0:
-        cache_path = os.path.join(folder, "cached_dataset.pt")
-        try:
-            sample_x = all_pos[0][0]
-            feature_dim = int(sample_x.numel())
-            num_pos = len(all_pos)
-            bytes_needed = num_pos * feature_dim * 4  # float32
-            gb_needed = bytes_needed / (1024 ** 3)
-            print(f"[DATA] Cache estimate: ~{gb_needed:.2f} GB for {num_pos} positions.")
-
-            MAX_CACHE_GB = 2.0
-            if gb_needed > MAX_CACHE_GB:
-                print(f"[DATA] Skipping cache save: estimated size {gb_needed:.2f} GB > {MAX_CACHE_GB} GB.")
-            else:
-                xs = torch.stack([x for x, _ in all_pos]).cpu()
-                ys = torch.tensor([float(y) for _, y in all_pos], dtype=torch.float32).cpu()
-                torch.save({"x": xs, "y": ys}, cache_path)
-                print(f"[DATA] Saved cached dataset to {cache_path} ({len(all_pos)} positions).")
-        except Exception as e:
-            print(f"[DATA] Failed to save cached dataset: {e}")
-    # ------------------------------
-
-    return all_pos
+    print(f"[DATA] Loaded {len(all_positions)} total positions from {folder}.")
+    return all_positions
 
 
 # ============================================================
-#  TRAINING SYSTEM
+#  REPLAY BUFFER + SELF-PLAY + STOCKFISH GAMES
 # ============================================================
 
-if TORCH_AVAILABLE and SimpleValueNet is not None:
+if TORCH_AVAILABLE and CnnValueNet is not None:
 
     class ReplayBuffer:
-        def __init__(self, cap=500000):
+        def __init__(self, cap: int = 500_000):
             self.cap = cap
-            self.data = []
+            # store (x, y, weight)
+            self.data: List[Tuple[torch.Tensor, float, float]] = []
 
-        def add(self, x, y):
+        def add(self, x, y, weight: float = 1.0):
             if len(self.data) >= self.cap:
                 self.data.pop(0)
-            self.data.append((x, y))
+            self.data.append((x, float(y), float(weight)))
 
         def extend(self, items):
-            for x, y in items:
-                self.add(x, y)
+            for item in items:
+                if len(item) == 3:
+                    x, y, w = item
+                else:
+                    # backward compatibility if something passes (x, y)
+                    x, y = item
+                    w = 1.0
+                self.add(x, y, w)
 
-        def sample(self, n):
+        def sample(self, n: int):
             batch = random.sample(self.data, min(n, len(self.data)))
-            xs, ys = zip(*batch)
+            xs, ys, ws = zip(*batch)
             xs = torch.stack(xs).to(DEVICE)
             ys = torch.tensor(ys, dtype=torch.float32).to(DEVICE)
-            return xs, ys
+            ws = torch.tensor(ws, dtype=torch.float32).to(DEVICE)
+            return xs, ys, ws
 
         def __len__(self):
             return len(self.data)
 
     REPLAY = ReplayBuffer()
-
 else:
     REPLAY = None
 
 
-def choose_move_for_selfplay(board: Board) -> Optional[Move]:
-    """
-    Self-play move selection.
-    Uses shallow search so training games are faster.
-    """
+def choose_move_for_selfplay(board: Board, depth: int) -> Optional[Move]:
     legal = list(board.generate_legal_moves())
     if not legal:
         return None
-
-    move, _ = choose_move_with_search(board, legal_moves=legal, depth=SELFPLAY_DEPTH)
+    move, _ = choose_move_with_search(board, legal_moves=legal, depth=depth)
     return move
 
 
-def self_play_game(max_moves=512):
+def self_play_game(max_moves: int = 300, depth: int = SELFPLAY_DEPTH):
     """
-    Self-play one game using current MODEL, return list of (features, target_value).
+    Self-play game with the current MODEL.
+
+    We "backpropagate" the game result to all positions in the trajectory:
+      - For each position we store (x, y, 1.0) where y is +1/-1/0 from POV of
+        side to move in that position.
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return []
+
+    board = Board()
+    traj = []
+
+    for _ in range(max_moves):
+        if board.is_game_over():
+            break
+        x = board_to_tensor(board)
+        if x is not None:
+            traj.append((board.turn, x))
+
+        mv = choose_move_for_selfplay(board, depth=depth)
+        if mv is None:
+            break
+        board.push(mv)
+
+    res = board.result(claim_draw=True)
+    if res == "1-0":
+        w, b = 1.0, -1.0
+    elif res == "0-1":
+        w, b = -1.0, 1.0
+    else:
+        w = b = 0.0
+
+    labeled = [(x, w if turn else b, 1.0) for (turn, x) in traj]
+    return labeled
+
+
+# --------------------------- Stockfish wrapper ---------------------------
+
+def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int] = None):
+    """
+    Launch Stockfish with optional strength limiting via:
+      - UCI_LimitStrength + UCI_Elo (preferred)
+      - Skill Level (0–20)
+    Returns (engine, ok_flag).
+    """
+    if not os.path.exists(STOCKFISH_PATH):
+        print(f"[SF] Stockfish not found at: {STOCKFISH_PATH}")
+        return None, False
+
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci([STOCKFISH_PATH])
+        print("[SF] Stockfish engine started.")
+    except Exception as e:
+        print(f"[SF] Error launching Stockfish: {e}")
+        return None, False
+
+    try:
+        opts = engine.options
+    except Exception as e:
+        print(f"[SF] Could not read engine options: {e}")
+        return engine, True
+
+    # Elo limiting
+    if sf_elo is not None and "UCI_LimitStrength" in opts and "UCI_Elo" in opts:
+        elo_opt = opts["UCI_Elo"]
+        min_elo = getattr(elo_opt, "min", 1320)
+        max_elo = getattr(elo_opt, "max", 3000)
+        requested = int(sf_elo)
+        clamped = max(min_elo, min(requested, max_elo))
+        cfg = {"UCI_LimitStrength": True, "UCI_Elo": clamped}
+        try:
+            engine.configure(cfg)
+            if clamped != requested:
+                print(f"[SF] Requested Elo {requested}, clamped to [{min_elo},{max_elo}] → {clamped}.")
+            else:
+                print(f"[SF] Configured Stockfish Elo {clamped}.")
+            return engine, True
+        except Exception as e:
+            print(f"[SF] Failed Elo config {cfg}: {e}")
+
+    # Skill Level fallback
+    if "Skill Level" in opts:
+        if sf_skill is None:
+            sf_skill = 0  # easiest
+        skill = max(0, min(20, int(sf_skill)))
+        cfg = {"Skill Level": skill}
+        try:
+            engine.configure(cfg)
+            print(f"[SF] Configured Stockfish Skill Level = {skill}.")
+            return engine, True
+        except Exception as e:
+            print(f"[SF] Failed Skill Level config {cfg}: {e}")
+
+    print("[SF] Running Stockfish at full strength (no limiting).")
+    return engine, True
+
+
+def game_vs_stockfish(
+    engine,
+    our_color=chess.WHITE,
+    max_moves: int = STOCKFISH_MAX_MOVES,
+    our_depth: int = TRAIN_SEARCH_DEPTH,
+):
+    """
+    Play one game vs Stockfish. Returns (labeled_positions, result_from_our_pov).
+    Labeled positions include weight=1.0 (no Elo here).
+    """
+    if MODEL is None or not TORCH_AVAILABLE:
+        return [], 0.0
 
     board = Board()
     traj = []
@@ -1138,10 +952,19 @@ def self_play_game(max_moves=512):
         if x is not None:
             traj.append((board.turn, x))
 
-        m = choose_move_for_selfplay(board)
-        if m is None:
+        if board.turn == our_color:
+            mv = choose_move_for_selfplay(board, depth=our_depth)
+        else:
+            try:
+                result = engine.play(board, chess.engine.Limit(time=STOCKFISH_TIME_LIMIT))
+                mv = result.move
+            except Exception as e:
+                print("[SF] Engine error:", e)
+                break
+
+        if mv is None:
             break
-        board.push(m)
+        board.push(mv)
 
     res = board.result(claim_draw=True)
     if res == "1-0":
@@ -1151,138 +974,232 @@ def self_play_game(max_moves=512):
     else:
         w = b = 0.0
 
-    labeled = []
-    for turn, x in traj:
-        labeled.append((x, w if turn else b))
+    labeled = [(x, w if turn else b, 1.0) for (turn, x) in traj]
 
-    return labeled
+    if res == "1-0":
+        result_value = 1.0 if our_color == chess.WHITE else -1.0
+    elif res == "0-1":
+        result_value = 1.0 if our_color == chess.BLACK else -1.0
+    else:
+        result_value = 0.0
+
+    return labeled, result_value
 
 
-def train_step(optimizer, batch=128):
+# ============================================================
+#  BACKPROP STEP + TRAINING LOOP
+# ============================================================
+
+def backprop_step(optimizer, batch_size: int = 512):
+    """
+    One explicit backpropagation step:
+      - Sample a mini-batch from the replay buffer
+      - Compute weighted MSE loss between NN predictions and target values
+        using Elo-based sample weights:
+            loss = mean( weight_i * (pred_i - y_i)^2 )
+      - Backpropagate gradients and update weights
+    """
     if MODEL is None or REPLAY is None or len(REPLAY) == 0:
         return None
 
     MODEL.train()
-    xs, ys = REPLAY.sample(batch)
+    xs, ys, ws = REPLAY.sample(batch_size)
     preds = MODEL(xs)
-    loss = F.mse_loss(preds, ys)
+    loss_vec = (preds - ys) ** 2
+
+    # Normalize weights so their mean is ~1, so LR stays sane
+    ws = ws / (ws.mean() + 1e-8)
+    loss = (ws * loss_vec).mean()
+
     optimizer.zero_grad()
-    loss.backward()
+    loss.backward()   # <-- backpropagation happens here
     optimizer.step()
     MODEL.eval()
     return float(loss.item())
 
 
-def evaluate_on_validation(val_x, val_y):
-    if MODEL is None or val_x is None or val_y is None:
-        return None
-    MODEL.eval()
-    with torch.no_grad():
-        preds = MODEL(val_x)
-        loss = F.mse_loss(preds, val_y)
-    return float(loss.item())
+def run_stockfish_elo_ladder(eval_elos=None, games_per_level: int = EVAL_GAMES_PER_LEVEL):
+    if MODEL is None or not TORCH_AVAILABLE:
+        print("[EVAL] No model / torch for ladder.")
+        return
+
+    if eval_elos is None:
+        eval_elos = EVAL_ELOS
+
+    print("\n[EVAL] ===== Stockfish Elo ladder evaluation =====")
+    for elo in eval_elos:
+        engine, ok = create_stockfish_engine(sf_elo=elo)
+        if not ok or engine is None:
+            print(f"[EVAL] Could not start Stockfish {elo}. Skipping.")
+            continue
+
+        wins = draws = losses = 0
+        for i in range(games_per_level):
+            color = chess.WHITE if i % 2 == 0 else chess.BLACK
+            _, res_val = game_vs_stockfish(engine, our_color=color)
+            if res_val > 0:
+                wins += 1
+            elif res_val < 0:
+                losses += 1
+            else:
+                draws += 1
+            print(f"[EVAL] Elo {elo} — game {i+1}/{games_per_level}: result={res_val}")
+
+        try:
+            engine.quit()
+        except Exception:
+            pass
+
+        played = wins + draws + losses
+        if played == 0:
+            print(f"[EVAL] Elo {elo}: no completed games.")
+            continue
+
+        score = (wins + 0.5 * draws) / played
+        if score <= 0.0 or score >= 1.0:
+            perf_str = "undefined (score too extreme)"
+        else:
+            perf = elo + 400 * math.log10(score / (1 - score))
+            perf_str = f"≈ {perf:.0f}"
+
+        print(f"[EVAL] vs SF {elo}: {wins}-{losses}-{draws} "
+              f"(score={score:.3f}) → performance {perf_str}")
+    print("[EVAL] ==========================================\n")
 
 
-def train_with_datasets_and_selfplay(
-    dataset_folder="datasets",
-    max_positions=100000,
-    selfplay_games=20,
-    steps_per_game=5,
-    batch=512,
-    lr=1e-3,
+def train_forever(
+    dataset_folder: str = "datasets",
+    max_dataset_positions: Optional[int] = None,
+    batch_size: int = 512,
+    base_lr: float = 1e-3,
+    selfplay_games_per_cycle: int = 10,
 ):
     """
-    Main training driver:
-      1) load all datasets (cached if possible)
-      2) split into train/val
-      3) do self-play and train with replay
-      4) save latest + best model (by val loss)
-
-    If interrupted with Ctrl+C, the best model so far (if any) is
-    saved to MODEL_PATH before exiting.
+    Main training driver.
+    - Load supervised data once into replay (Elo-weighted).
+    - Infinite cycles:
+        - many self-play games
+        - a few games vs Stockfish
+        - multiple backprop_step() calls per cycle
+    - Periodically runs an Elo ladder.
+    - Ctrl-C to stop; final/best model saved.
     """
-    if not TORCH_AVAILABLE or SimpleValueNet is None:
-        print("[TRAIN] Torch not available or model class missing.")
+    if not TORCH_AVAILABLE or CnnValueNet is None:
+        print("[TRAIN] Torch or CNN not available, cannot train.")
         return
 
     global MODEL
     if MODEL is None:
         init_model()
         if MODEL is None:
-            print("[TRAIN] No model instance available.")
+            print("[TRAIN] No model instance; aborting.")
             return
 
-    optimizer = torch.optim.Adam(MODEL.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(MODEL.parameters(), lr=base_lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, verbose=True
+        optimizer, mode="min", factor=0.5, patience=5, verbose=True
     )
 
-    # 1) load all datasets
-    data = load_all_datasets(dataset_folder, max_positions)
-    if not data:
-        print("[TRAIN] No dataset positions loaded.")
-        return
-
-    # 2) split into train / validation
-    random.shuffle(data)
-    split_idx = int(0.9 * len(data)) if len(data) >= 10 else len(data)
-    train_data = data[:split_idx]
-    val_data = data[split_idx:]
-
-    if REPLAY is not None:
-        REPLAY.extend(train_data)
-        print(f"[TRAIN] Replay size after dataset load: {len(REPLAY)}")
+    # Supervised data
+    data = load_all_datasets(dataset_folder, max_dataset_positions)
+    if data:
+        random.shuffle(data)
+        if REPLAY is not None:
+            REPLAY.extend(data)
+            print(f"[TRAIN] Replay size after supervised load: {len(REPLAY)}")
     else:
-        print("[TRAIN] WARNING: No replay buffer, skipping training.")
-        return
+        print("[TRAIN] No supervised dataset loaded; relying on self-play + Stockfish only.")
 
-    if val_data and TORCH_AVAILABLE:
-        val_x = torch.stack([x for x, _ in val_data]).to(DEVICE)
-        val_y = torch.tensor([float(y) for _, y in val_data], dtype=torch.float32).to(DEVICE)
-        print(f"[TRAIN] Validation set size: {len(val_data)}")
-    else:
-        val_x = None
-        val_y = None
-        print("[TRAIN] No validation set (too few positions).")
+    best_val_like_loss = None
+    best_state = None
+    total_selfplay_games = 0
 
-    best_val_loss = None
-    best_state_dict = None
+    def estimate_val_like_loss(num_samples: int = 4096):
+        if REPLAY is None or len(REPLAY) == 0:
+            return None
+        MODEL.eval()
+        with torch.no_grad():
+            xs, ys, ws = REPLAY.sample(min(num_samples, len(REPLAY)))
+            preds = MODEL(xs)
+            # approximate validation: ignore weights here, it's just a metric
+            loss = F.mse_loss(preds, ys)
+        return float(loss.item())
+
+    # Stockfish engine for training games
+    sf_engine, sf_ok = create_stockfish_engine(sf_elo=1000)
 
     try:
-        # 3) self-play + train
-        for g in range(1, selfplay_games + 1):
-            pos = self_play_game()
-            if REPLAY is not None:
-                REPLAY.extend(pos)
-            print(f"[TRAIN] Game {g}/{selfplay_games} — {len(pos)} self-play positions.")
+        cycle = 0
+        while True:
+            cycle += 1
+            print(f"\n[TRAIN] ===== Cycle {cycle} =====")
 
+            # --- Self-play ---
+            for g in range(selfplay_games_per_cycle):
+                positions = self_play_game()
+                if REPLAY is not None:
+                    REPLAY.extend(positions)
+                total_selfplay_games += 1
+                print(f"[TRAIN] Self-play game {total_selfplay_games}: {len(positions)} positions, "
+                      f"replay size={len(REPLAY)}")
+
+            # --- Games vs Stockfish ---
+            if sf_ok and sf_engine is not None:
+                for i in range(2):  # two games per cycle (white & black)
+                    color = chess.WHITE if i % 2 == 0 else chess.BLACK
+                    pos_sf, res = game_vs_stockfish(sf_engine, our_color=color)
+                    if REPLAY is not None:
+                        REPLAY.extend(pos_sf)
+                    print(f"[TRAIN] vs Stockfish ({'White' if color == chess.WHITE else 'Black'}): "
+                          f"{len(pos_sf)} positions, result={res}, replay={len(REPLAY)}")
+
+            # --- Backprop steps ---
+            steps = max(10, selfplay_games_per_cycle * 5)
             last_loss = None
-            for _ in range(steps_per_game):
-                last_loss = train_step(optimizer, batch)
+            for _ in range(steps):
+                last_loss = backprop_step(optimizer, batch_size=batch_size)
 
-            val_loss = evaluate_on_validation(val_x, val_y) if val_x is not None else None
-            if val_loss is not None:
-                print(f"[TRAIN] Loss after game {g}: train={last_loss:.6f}, val={val_loss:.6f}")
-                scheduler.step(val_loss)
+            # --- Eval / LR scheduler ---
+            val_like_loss = estimate_val_like_loss()
+            print(f"[TRAIN] Cycle {cycle} done. Last train_loss={last_loss}, "
+                  f"val_like_loss={val_like_loss}")
 
-                if best_val_loss is None or val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_state_dict = MODEL.state_dict()
-                    torch.save(best_state_dict, BEST_MODEL_PATH)
-                    print(f"[TRAIN] New best model saved to {BEST_MODEL_PATH} (val_loss={val_loss:.6f})")
-            else:
-                print(f"[TRAIN] Loss after game {g}: train={last_loss:.6f}")
+            if val_like_loss is not None:
+                scheduler.step(val_like_loss)
+                if best_val_like_loss is None or val_like_loss < best_val_like_loss:
+                    best_val_like_loss = val_like_loss
+                    best_state = MODEL.state_dict()
+                    torch.save(best_state, BEST_MODEL_PATH)
+                    print(f"[TRAIN] New best model saved at {BEST_MODEL_PATH} "
+                          f"(loss={val_like_loss:.6f})")
+
+            # --- Periodic Elo ladder ---
+            if total_selfplay_games % EVAL_LADDER_INTERVAL_GAMES == 0:
+                run_stockfish_elo_ladder()
+
+            # Save current model each cycle as a safety net
+            torch.save(MODEL.state_dict(), MODEL_PATH)
+            print(f"[TRAIN] Saved current model to {MODEL_PATH}")
 
     except KeyboardInterrupt:
-        print("\n[TRAIN] Training interrupted by user (Ctrl+C). Saving best model so far...")
+        print("\n[TRAIN] Training interrupted by user (Ctrl-C). Saving final model...")
 
     finally:
-        if best_state_dict is not None:
-            torch.save(best_state_dict, MODEL_PATH)
+        # Close Stockfish
+        if sf_engine is not None:
+            try:
+                sf_engine.quit()
+                print("[SF] Engine closed.")
+            except Exception:
+                pass
+
+        # Save best / last model
+        if best_state is not None:
+            torch.save(best_state, MODEL_PATH)
             print(f"[TRAIN] Saved best-so-far model to {MODEL_PATH}.")
-        else:
+        elif MODEL is not None:
             torch.save(MODEL.state_dict(), MODEL_PATH)
-            print("[TRAIN] Saved latest model.pt (no best_val_loss recorded).")
+            print("[TRAIN] Saved latest model.pt (no best model tracked).")
 
 
 # ============================================================
@@ -1290,14 +1207,14 @@ def train_with_datasets_and_selfplay(
 # ============================================================
 
 if __name__ == "__main__":
-    if not TORCH_AVAILABLE or SimpleValueNet is None:
-        print("[TRAIN] Torch not installed or model missing — cannot train.")
+    if not TORCH_AVAILABLE or CnnValueNet is None:
+        print("[TRAIN] Torch/CNN not available — cannot train.")
     else:
-        train_with_datasets_and_selfplay(
+        # This will run until you hit Ctrl-C.
+        train_forever(
             dataset_folder="datasets",
-            max_positions=200000,
-            selfplay_games=20,
-            steps_per_game=100,
-            batch=512,
-            lr=1e-3,
+            max_dataset_positions=None,   # or an int if you want to cap
+            batch_size=512,
+            base_lr=1e-3,
+            selfplay_games_per_cycle=10,
         )
