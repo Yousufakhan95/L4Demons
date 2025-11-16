@@ -1,12 +1,11 @@
 # ============================================================
-#  FAST CNN-BASED CHESSHACKS BOT (1-PLY + SANITY CHECK)
-#  - All decisions by the NN (no handcrafted search heuristics)
-#  - 1-ply lookahead for speed
-#  - Tiny extra check vs opponent's best replies (captures/checks)
-#    to avoid totally suicidal moves
-#  - Same network architecture as your original file, so your
-#    existing model.pt still loads.
-#  - Self-play + Stockfish training still supported (1-ply logic).
+#  CNN-BASED CHESSHACKS BOT + TRAINING ENGINE (DYNAMIC DEPTH)
+#  - CNN value net over 8x8 planes
+#  - Negamax + alpha-beta + quiescence
+#  - Dynamic search depth for actual games
+#  - Supervised training from PGN/CSV with Elo weighting
+#  - Self-play + games vs Stockfish
+#  - Explicit backprop_step() for training (Ctrl-C to stop)
 # ============================================================
 
 from .utils import chess_manager, GameContext  # adapt if your path is different
@@ -21,9 +20,6 @@ import csv
 import numpy as np
 from typing import Optional, List, Tuple
 import concurrent.futures
-import inspect
-import shutil
-import sys
 
 # ============================================================
 #  TORCH SETUP
@@ -57,39 +53,13 @@ FEATURE_DIM = NUM_PLANES * BOARD_SIZE * BOARD_SIZE + 4
 
 MODEL = None
 DEVICE = "cuda"
-MODEL_PATH = os.path.join(ROOT_DIR, "weights", "model.pt")
-BEST_MODEL_PATH = os.path.join(ROOT_DIR, "weights", "model_best.pt")
+MODEL_PATH = os.path.join(ROOT_DIR,"src", "weights", "model.pt")
+BEST_MODEL_PATH = os.path.join(ROOT_DIR, "src", "weights", "model_best.pt")
 
 # ---------------------------
 # Stockfish config
 # ---------------------------
-def find_stockfish():
-    """Return a sensible Stockfish executable path for this environment."""
-    engines_dir = os.path.join(ROOT_DIR, "engines")
-    candidates = [
-        os.path.join(engines_dir, "stockfish"),
-        os.path.join(engines_dir, "stockfish.exe"),
-        os.path.join(engines_dir, "stockfish-linux"),
-        os.path.join(engines_dir, "stockfish_14"),
-        os.path.join(engines_dir, "stockfish_15"),
-    ]
-
-    for p in candidates:
-        if os.path.exists(p) and os.access(p, os.X_OK):
-            return p
-
-    which_sf = shutil.which("stockfish")
-    if which_sf:
-        return which_sf
-
-    for p in ["/usr/bin/stockfish", "/usr/local/bin/stockfish", "/root/project/engines/stockfish"]:
-        if os.path.exists(p) and os.access(p, os.X_OK):
-            return p
-
-    return os.path.join(engines_dir, "stockfish")
-
-
-STOCKFISH_PATH = find_stockfish()
+STOCKFISH_PATH = os.path.join(ROOT_DIR, "engines", "stockfish.exe")
 STOCKFISH_TIME_LIMIT = 0.03  # seconds per move for training/eval
 STOCKFISH_MAX_MOVES = 200
 
@@ -99,11 +69,15 @@ EVAL_GAMES_PER_LEVEL = 4
 EVAL_LADDER_INTERVAL_GAMES = 20  # run ladder every N self-play games
 
 # ---------------------------
-# Search config (SPEED MODE)
+# Search config
 # ---------------------------
-# We conceptually keep these, but move selection is 1-ply NN-based.
-SELFPLAY_DEPTH = 1             # depth for self-play
-TRAIN_SEARCH_DEPTH = 1         # depth vs Stockfish
+# Base depth for online play (you can tweak this):
+BASE_SEARCH_DEPTH = 2          # starting point
+MIN_SEARCH_DEPTH = 2          # clamp
+MAX_SEARCH_DEPTH = 2           # clamp
+
+SELFPLAY_DEPTH = 2             # depth in self-play for speed
+TRAIN_SEARCH_DEPTH = 3         # depth vs Stockfish in training
 
 # ---------------------------
 # Data config
@@ -113,6 +87,8 @@ MIN_FULLMOVES_FOR_PGN_LABEL = 10  # start labeling after move 10
 # ---------------------------
 # Elo weighting config
 # ---------------------------
+# Average Elo between players is mapped to a [0.1, 1.0] weight.
+# Below MIN_AVG_ELO_FOR_WEIGHT → use 0.1; above MAX → use 1.0.
 MIN_AVG_ELO_FOR_WEIGHT = 1400
 MAX_AVG_ELO_FOR_WEIGHT = 2400
 
@@ -159,7 +135,7 @@ def board_to_tensor(board: chess.Board):
 
 
 # ============================================================
-#  CNN VALUE NETWORK (ORIGINAL ARCH)
+#  CNN VALUE NETWORK
 # ============================================================
 
 if TORCH_AVAILABLE and nn is not None:
@@ -168,7 +144,7 @@ if TORCH_AVAILABLE and nn is not None:
         """
         CNN over board planes + small dense head with extra meta features.
         Input: flat vector length FEATURE_DIM
-        Output: scalar value in [-1, 1] (as trained).
+        Output: scalar value in [-1, 1] from White's POV for given board.
         """
         def __init__(self, input_dim: int, num_planes: int = NUM_PLANES):
             super().__init__()
@@ -177,7 +153,7 @@ if TORCH_AVAILABLE and nn is not None:
             self.board_vec_dim = board_vec_dim
             self.meta_dim = input_dim - board_vec_dim  # should be 4
 
-            # Matches your original values: 32 / 64 / 64 conv, 512/128 dense
+            # Convolutional trunk over 8x8 planes
             self.conv1 = nn.Conv2d(num_planes, 32, kernel_size=3, padding=1)
             self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
             self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
@@ -225,7 +201,7 @@ def init_model():
         return
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f("[ML] Using device: {DEVICE}") if False else f"[ML] Using device: {DEVICE}")
+    print(f"[ML] Using device: {DEVICE}")
 
     MODEL = CnnValueNet(FEATURE_DIM).to(DEVICE)
 
@@ -253,20 +229,20 @@ init_model()
 #  SIMPLE EVAL + NN-BASED EVAL
 # ============================================================
 
-# Basic material values in centipawns (used only for stabilizer eval)
+# Basic material values in centipawns
 PIECE_VALUES = {
     chess.PAWN:   100,
     chess.KNIGHT: 320,
     chess.BISHOP: 330,
     chess.ROOK:   500,
     chess.QUEEN:  900,
-    chess.KING:   0,
+    chess.KING:   0,  # king safety handled separately if needed
 }
 
 
 def material_eval_cp(board: chess.Board) -> int:
     score = 0
-    for _, piece in board.piece_map().items():
+    for square, piece in board.piece_map().items():
         val = PIECE_VALUES.get(piece.piece_type, 0)
         if piece.color == chess.WHITE:
             score += val
@@ -277,15 +253,17 @@ def material_eval_cp(board: chess.Board) -> int:
 
 def simple_classical_eval(board: chess.Board) -> float:
     """
-    Very simple classical eval in [-1, 1], as a stabilizer.
+    Very simple classical eval in [-1, 1], from side-to-move POV.
+    We mostly rely on CNN; this is just a stabilizer.
     """
     cp = material_eval_cp(board)
 
+    # Normalize to [-1, 1] assuming ±2000cp extremes
     MAX_CP = 2000.0
     cp = max(-MAX_CP, min(MAX_CP, float(cp)))
     val = cp / MAX_CP
 
-    # POV = side to move
+    # side-to-move POV
     if board.turn == chess.WHITE:
         return val
     else:
@@ -294,10 +272,11 @@ def simple_classical_eval(board: chess.Board) -> float:
 
 def evaluate_position(board: chess.Board) -> float:
     """
-    Final evaluation in [-1, 1] from POV of SIDE TO MOVE.
+    Final evaluation from POV of side to move, in [-1, 1].
+
     Combination:
-      - simple_classical_eval
-      - CNN value net
+      - light classical eval
+      - CNN value net (stronger pattern recognition)
     """
     classical = simple_classical_eval(board)
 
@@ -310,8 +289,9 @@ def evaluate_position(board: chess.Board) -> float:
 
     with torch.no_grad():
         x = x.to(DEVICE).unsqueeze(0)
-        v = MODEL(x)[0].item()  # NN raw output
+        v = MODEL(x)[0].item()  # NN output in [-1, 1]
 
+    # Blend weights. You can tune these.
     ALPHA = 0.2  # classical
     BETA = 0.8   # CNN
 
@@ -319,7 +299,39 @@ def evaluate_position(board: chess.Board) -> float:
 
 
 # ============================================================
-#  SOFTMAX UTILITY
+#  DYNAMIC DEPTH FOR ACTUAL GAMES
+# ============================================================
+
+def estimate_material_phase(board: chess.Board) -> float:
+    """
+    Rough material count in "pawns" for both sides combined.
+    Used to guess opening / middlegame / endgame.
+    """
+    total_cp = 0
+    for _, piece in board.piece_map().items():
+        total_cp += PIECE_VALUES.get(piece.piece_type, 0)
+    # pawns-equivalent
+    return total_cp / 100.0
+
+
+def get_dynamic_depth(board: chess.Board) -> int:
+    """
+    Dynamic depth for actual dashboard games.
+
+    Heuristics:
+      - Start from BASE_SEARCH_DEPTH
+      - Increase depth in:
+          * Endgames (low material)
+          * Later in the game (fullmove_number big)
+          * When side to move is in check (tactical)
+      - Clamp between MIN_SEARCH_DEPTH and MAX_SEARCH_DEPTH
+    """
+    depth = BASE_SEARCH_DEPTH
+    return depth
+
+
+# ============================================================
+#  NEGAMAX + ALPHA-BETA + QUIESCENCE
 # ============================================================
 
 def softmax(scores: List[float]) -> List[float]:
@@ -333,134 +345,102 @@ def softmax(scores: List[float]) -> List[float]:
     return [e / total for e in exps]
 
 
-# ============================================================
-#  OPPONENT WORST-REPLY EVAL (TINY 2-PLY CHECK)
-# ============================================================
-
-def evaluate_worst_reply(board: chess.Board, max_replies: int = 10) -> Optional[float]:
+def quiescence(board: chess.Board, alpha: float, beta: float, depth_cap: int = 4) -> float:
     """
-    Given a position where it's the OPPONENT's turn,
-    estimate how bad their BEST reply can make things for us.
-
-    - Look at up to `max_replies` opponent moves, prioritizing captures / checks / promotions.
-    - For each:
-        push reply → evaluate_position() → pop.
-      evaluate_position is from POV of SIDE TO MOVE (which will be US again,
-      since they'll have just moved), so that value is "for us".
-    - Return the *worst* (minimum) value from our POV.
+    Very small quiescence search:
+      - Only explore capture moves (and promotions)
+      - Limit depth to avoid explosion.
     """
-    replies = list(board.generate_legal_moves())
-    if not replies:
-        # No legal moves: checkmate or stalemate
-        if board.is_checkmate():
-            # They are mated → our previous move was winning.
-            return 1.0
-        else:
-            # Stalemate
-            return 0.0
+    stand_pat = evaluate_position(board)
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
 
-    # Prioritize tactical, forcing moves
-    def reply_key(m: chess.Move):
-        is_cap = board.is_capture(m)
-        gives_chk = board.gives_check(m)
-        is_promo = (m.promotion is not None)
-        # Captures / promos / checks > quiet moves
-        return (is_cap, is_promo, gives_chk)
+    if depth_cap <= 0:
+        return alpha
 
-    replies.sort(key=reply_key, reverse=True)
-    replies = replies[:max_replies]
-
-    worst_score = None
-
-    for r in replies:
-        board.push(r)
-        # Now it's our turn again; eval from side-to-move POV (us).
-        val_for_us = evaluate_position(board)
+    for move in board.generate_legal_moves():
+        if not board.is_capture(move) and not move.promotion:
+            continue
+        board.push(move)
+        score = -quiescence(board, -beta, -alpha, depth_cap - 1)
         board.pop()
 
-        if worst_score is None or val_for_us < worst_score:
-            worst_score = val_for_us
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
 
-    return worst_score
+    return alpha
 
 
-# ============================================================
-#  1-PLY FAST MOVE SELECTION + SANITY
-# ============================================================
+def negamax(board: chess.Board, depth: int, alpha: float, beta: float) -> float:
+    """
+    Negamax with alpha-beta pruning and quiescence at leaf nodes.
+    """
+    if depth == 0 or board.is_game_over():
+        return quiescence(board, alpha, beta)
 
-def choose_move_fast(
+    max_eval = -float("inf")
+    legal_moves = list(board.generate_legal_moves())
+    # Optional: simple move ordering (captures first)
+    legal_moves.sort(key=lambda m: board.is_capture(m), reverse=True)
+
+    for move in legal_moves:
+        board.push(move)
+        eval_score = -negamax(board, depth - 1, -beta, -alpha)
+        board.pop()
+
+        if eval_score > max_eval:
+            max_eval = eval_score
+
+        if eval_score > alpha:
+            alpha = eval_score
+        if alpha >= beta:
+            break  # cutoff
+
+    return max_eval
+
+
+def choose_move_with_search(
     board: chess.Board,
     legal_moves,
+    depth: Optional[int] = None,
 ):
     """
-    SPEED + NOT-TOTALLY-DUMB:
+    Use negamax + alpha-beta to pick the best move.
 
-    Pass 1:
-      - For every legal move:
-          * push
-          * eval resulting position with NN (1-ply)
-          * our_score = -eval(after)
-          * pop
-
-    Pass 2 (cheap sanity):
-      - Take top K moves by our_score.
-      - For each, push it and let opponent "play best"
-        using a 1-ply search over their most forcing replies
-        (captures / promotions / checks).
-      - worst_reply_score = evaluate_worst_reply(...)
-      - combined_score = 0.3 * our_score + 0.7 * worst_reply_score
-
-    This avoids moves that walk into super obvious tactics,
-    while still staying fast.
+    If depth is None:
+      - For *actual games* (dashboard), we call this with depth=None and
+        dynamically compute depth with get_dynamic_depth(board).
     """
     if not legal_moves:
         return None, {}
 
-    # No NN? Fall back to random.
+    # If no NN available, fall back to random
     if not TORCH_AVAILABLE or MODEL is None:
         n = len(legal_moves)
         return random.choice(legal_moves), {m: 1.0 / n for m in legal_moves}
 
-    base_scores: List[float] = []
+    if depth is None:
+        depth = get_dynamic_depth(board)
 
-    # ---------- PASS 1: 1-ply NN eval for all moves ----------
+    best_score = -float("inf")
+    best_move = None
+    scores = []
+
     for move in legal_moves:
         board.push(move)
-        # eval_result is from POV of side-to-move AFTER our move (opponent)
-        eval_result = evaluate_position(board)
+        score = -negamax(board, depth - 1, -float("inf"), float("inf"))
         board.pop()
 
-        # Our POV = negative of opponent's POV
-        our_score = -eval_result
-        base_scores.append(our_score)
+        scores.append(score)
+        if best_move is None or score > best_score:
+            best_score = score
+            best_move = move
 
-    # ---------- PASS 2: refine top-K moves by looking at replies ----------
-    indices = list(range(len(legal_moves)))
-    indices.sort(key=lambda i: base_scores[i], reverse=True)
-
-    K = min(4, len(indices))   # only refine top 4 candidates
-    refined_scores = list(base_scores)
-
-    for idx in indices[:K]:
-        move = legal_moves[idx]
-        board.push(move)
-        # Now opponent to move; see how bad their best reply is.
-        worst_reply = evaluate_worst_reply(board, max_replies=10)
-        board.pop()
-
-        if worst_reply is None:
-            worst_reply = -1.0  # be pessimistic if something goes wrong
-
-        # Blend immediate score and worst reply;
-        # weight reply more so we avoid walking into obvious tactics.
-        combined = 0.3 * base_scores[idx] + 0.7 * worst_reply
-        refined_scores[idx] = combined
-
-    # ---------- Final choice + softmax probs ----------
-    best_idx = max(range(len(refined_scores)), key=lambda i: refined_scores[i])
-    best_move = legal_moves[best_idx]
-
-    probs = softmax(refined_scores)
+    probs = softmax(scores)
     prob_map = {m: p for m, p in zip(legal_moves, probs)}
     return best_move, prob_map
 
@@ -474,15 +454,16 @@ def test_func(ctx: GameContext):
     """
     Called for every move request by ChessHacks.
 
-    - Uses 1-ply NN eval + small opponent-reply sanity.
-    - No deep tree search.
+    - Uses dynamic depth for search (get_dynamic_depth).
+    - Depth scales with phase of game + checks.
     """
     legal_moves = list(ctx.board.generate_legal_moves())
     if not legal_moves:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available.")
 
-    move, prob_map = choose_move_fast(ctx.board, legal_moves)
+    # depth=None → use dynamic depth
+    move, prob_map = choose_move_with_search(ctx.board, legal_moves, depth=None)
     ctx.logProbabilities(prob_map)
     return move
 
@@ -491,7 +472,6 @@ def test_func(ctx: GameContext):
 def reset_func(ctx: GameContext):
     """
     Called when a new game starts.
-    Nothing to reset in this minimal-speed version.
     """
     pass
 
@@ -517,7 +497,7 @@ def compute_elo_weight(avg_elo: Optional[float]) -> float:
     Map average Elo to a weight in [0.1, 1.0].
     - If Elo is unknown → 1.0
     - Below MIN_AVG_ELO_FOR_WEIGHT → 0.1
-    - Above MAX → 1.0
+    - Above MAX_AVG_ELO_FOR_WEIGHT → 1.0
     - Linear in between.
     """
     if avg_elo is None:
@@ -572,6 +552,7 @@ def load_pgn_dataset(path: str, max_positions: Optional[int] = None):
 
             headers = game.headers
 
+            # Try to fetch Elo from typical PGN tags
             w_elo = (
                 elo_str_to_int(headers.get("WhiteElo"))
                 or elo_str_to_int(headers.get("WhiteRating"))
@@ -627,7 +608,10 @@ def load_pgn_dataset(path: str, max_positions: Optional[int] = None):
 
 def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
     """
-    Load a Lichess games CSV and produce (x, y, w) triples.
+    Load a Lichess games CSV with columns including:
+      id, winner, moves, white_elo / black_elo or similar.
+
+    Outputs (x, y, w) triples with Elo-based weights.
     """
     if not TORCH_AVAILABLE or torch is None:
         print("[DATA] Torch not available; cannot load Lichess CSV.")
@@ -640,6 +624,7 @@ def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # winner
             winner = row.get("winner", "").strip().lower()
             if winner == "white":
                 winner_color = chess.WHITE
@@ -648,6 +633,7 @@ def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
             else:
                 winner_color = None
 
+            # Try a few common rating column names
             w_elo = (
                 elo_str_to_int(row.get("white_elo"))
                 or elo_str_to_int(row.get("white_rating"))
@@ -707,7 +693,7 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
     """
     Load everything in datasets folder:
       - *.pgn -> PGN games
-      - lichess-style *.csv
+      - lichess-style *.csv -> moves/winner
     Returns list of (x, y, weight).
     """
     if not TORCH_AVAILABLE:
@@ -729,8 +715,8 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
 
     # Parallel PGN loading
     if pgn_files:
+        print(f"[DATA] Parallel loading {len(pgn_files)} PGN files...")
         total = len(pgn_files)
-        print(f"[DATA] Parallel loading {total} PGN files...")
         completed = 0
 
         if max_positions is not None:
@@ -738,94 +724,29 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
         else:
             per_file_limit = None
 
-        max_workers = min(8, max(1, os.cpu_count() or 1))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        with concurrent.futures.ThreadPoolExecutor() as ex:
             futures = {}
             for f_name in pgn_files:
                 path = os.path.join(folder, f_name)
                 futures[ex.submit(load_pgn_dataset, path, per_file_limit)] = f_name
 
-            pending = set(futures.keys())
-            try:
-                idle_rounds = 0
-                while pending:
-                    done, pending = concurrent.futures.wait(
-                        pending,
-                        timeout=60,
-                        return_when=concurrent.futures.FIRST_COMPLETED,
-                    )
-                    if not done:
-                        idle_rounds += 1
-                        print("[DATA] Warning: no PGN finished within 60s; checking pending tasks...")
-                        if idle_rounds >= 3:
-                            stalled = [futures.get(fut, '<unknown>') for fut in pending]
-                            print(f"[DATA] Warning: parallel loading appears stalled. Stalled files: {stalled}")
-                            break
-                        continue
+            for fut in concurrent.futures.as_completed(futures):
+                fname = futures[fut]
+                try:
+                    pos = fut.result()
+                    all_positions.extend(pos)
+                    print(f"[DATA] PGN {fname}: {len(pos)} positions")
+                except Exception as e:
+                    print(f"[DATA] Failed to load PGN {fname}: {e}")
 
-                    idle_rounds = 0
-                    for fut in list(done):
-                        fname = futures.get(fut, "<unknown>")
-                        try:
-                            pos = fut.result(timeout=5)
-                            all_positions.extend(pos)
-                            print(f"[DATA] PGN {fname}: {len(pos)} positions")
-                        except Exception as e:
-                            print(f"[DATA] Failed to load PGN {fname}: {e}")
+                completed += 1
+                print(f"[DATA] PGN progress: {completed}/{total}")
 
-                        completed += 1
-                        print(f"[DATA] PGN progress: {completed}/{total}")
-
-                        if max_positions is not None and len(all_positions) >= max_positions:
-                            all_positions = all_positions[:max_positions]
-                            print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
-                            pending.clear()
-                            break
-
-                if pending:
-                    print(f"[DATA] Falling back to sequential load for {len(pending)} pending PGN(s).")
-                    for fut in list(pending):
-                        fname = futures.get(fut, "<unknown>")
-                        try:
-                            path = os.path.join(folder, fname)
-                        except Exception:
-                            path = None
-
-                        try:
-                            fut.cancel()
-                        except Exception:
-                            pass
-
-                        if path and os.path.exists(path):
-                            try:
-                                pos = load_pgn_dataset(path, per_file_limit)
-                                all_positions.extend(pos)
-                                print(f"[DATA] (sequential) PGN {fname}: {len(pos)} positions")
-                            except Exception as e:
-                                print(f"[DATA] (sequential) Failed to load PGN {fname}: {e}")
-                        else:
-                            print(f"[DATA] Could not determine path for stalled PGN {fname}; skipping.")
-
-                        completed += 1
-                        print(f"[DATA] PGN progress: {completed}/{total}")
-
-                        if max_positions is not None and len(all_positions) >= max_positions:
-                            all_positions = all_positions[:max_positions]
-                            print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
-                            break
-            except KeyboardInterrupt:
-                print("[DATA] Loading interrupted by user.")
-            except Exception as e:
-                print(f"[DATA] Unexpected error during parallel PGN loading: {e}")
-                for fut in list(pending):
-                    try:
-                        fname = futures.get(fut, "<unknown>")
-                        pos = fut.result(timeout=1)
-                        all_positions.extend(pos)
-                        print(f"[DATA] PGN {fname}: {len(pos)} positions (late)")
-                    except Exception:
-                        pass
-                pending.clear()
+                if max_positions is not None and len(all_positions) >= max_positions:
+                    all_positions = all_positions[:max_positions]
+                    print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
+                    csv_files = []
+                    break
 
     # CSV loading
     for f_name in csv_files:
@@ -841,7 +762,7 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
 
 
 # ============================================================
-#  REPLAY BUFFER + SELF-PLAY + STOCKFISH GAMES (1-PLY LOGIC)
+#  REPLAY BUFFER + SELF-PLAY + STOCKFISH GAMES
 # ============================================================
 
 if TORCH_AVAILABLE and CnnValueNet is not None:
@@ -850,7 +771,7 @@ if TORCH_AVAILABLE and CnnValueNet is not None:
         def __init__(self, cap: int = 500_000):
             self.cap = cap
             # store (x, y, weight)
-            self.data = []
+            self.data: List[Tuple[torch.Tensor, float, float]] = []
 
         def add(self, x, y, weight: float = 1.0):
             if len(self.data) >= self.cap:
@@ -862,6 +783,7 @@ if TORCH_AVAILABLE and CnnValueNet is not None:
                 if len(item) == 3:
                     x, y, w = item
                 else:
+                    # backward compatibility if something passes (x, y)
                     x, y = item
                     w = 1.0
                 self.add(x, y, w)
@@ -883,19 +805,20 @@ else:
 
 
 def choose_move_for_selfplay(board: Board, depth: int) -> Optional[Move]:
-    """
-    Self-play move choice. depth arg is ignored in speed mode; we use 1-ply.
-    """
     legal = list(board.generate_legal_moves())
     if not legal:
         return None
-    move, _ = choose_move_fast(board, legal_moves=legal)
+    move, _ = choose_move_with_search(board, legal_moves=legal, depth=depth)
     return move
 
 
-def self_play_game(max_moves: int = 600, depth: int = SELFPLAY_DEPTH):
+def self_play_game(max_moves: int = 300, depth: int = SELFPLAY_DEPTH):
     """
-    Self-play game with current MODEL, using 1-ply move choice.
+    Self-play game with the current MODEL.
+
+    We "backpropagate" the game result to all positions in the trajectory:
+      - For each position we store (x, y, 1.0) where y is +1/-1/0 from POV of
+        side to move in that position.
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return []
@@ -916,18 +839,6 @@ def self_play_game(max_moves: int = 600, depth: int = SELFPLAY_DEPTH):
         board.push(mv)
 
     res = board.result(claim_draw=True)
-    try:
-        plies = len(board.move_stack)
-        fullmoves = plies // 2
-        outcome = board.outcome(claim_draw=True)
-        if outcome is not None:
-            term = getattr(outcome, "termination", None)
-            winner = getattr(outcome, "winner", None)
-            print(f"[SELFPLAY] Finished: plies={plies}, fullmoves={fullmoves}, termination={term}, winner={winner}")
-        else:
-            print(f"[SELFPLAY] Finished: plies={plies}, fullmoves={fullmoves}, result={res}")
-    except Exception as _e:
-        print(f"[SELFPLAY] Finished: could not compute outcome details: {_e}")
     if res == "1-0":
         w, b = 1.0, -1.0
     elif res == "0-1":
@@ -943,7 +854,10 @@ def self_play_game(max_moves: int = 600, depth: int = SELFPLAY_DEPTH):
 
 def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int] = None):
     """
-    Launch Stockfish with optional strength limiting.
+    Launch Stockfish with optional strength limiting via:
+      - UCI_LimitStrength + UCI_Elo (preferred)
+      - Skill Level (0–20)
+    Returns (engine, ok_flag).
     """
     if not os.path.exists(STOCKFISH_PATH):
         print(f"[SF] Stockfish not found at: {STOCKFISH_PATH}")
@@ -953,25 +867,7 @@ def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int
         engine = chess.engine.SimpleEngine.popen_uci([STOCKFISH_PATH])
         print("[SF] Stockfish engine started.")
     except Exception as e:
-        print(f"[SF] Error launching Stockfish at {STOCKFISH_PATH}: {e}")
-        try:
-            alt = shutil.which("stockfish")
-            if alt and alt != STOCKFISH_PATH:
-                engine = chess.engine.SimpleEngine.popen_uci([alt])
-                print(f"[SF] Stockfish engine started via PATH at {alt}.")
-                return engine, True
-        except Exception as e2:
-            print(f"[SF] Fallback via PATH failed: {e2}")
-
-        alt2 = os.path.join(os.path.dirname(STOCKFISH_PATH), "stockfish")
-        if os.path.exists(alt2) and os.access(alt2, os.X_OK):
-            try:
-                engine = chess.engine.SimpleEngine.popen_uci([alt2])
-                print(f"[SF] Stockfish engine started via bundled path {alt2}.")
-                return engine, True
-            except Exception as e3:
-                print(f"[SF] Fallback via bundled path failed: {e3}")
-
+        print(f"[SF] Error launching Stockfish: {e}")
         return None, False
 
     try:
@@ -980,6 +876,7 @@ def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int
         print(f"[SF] Could not read engine options: {e}")
         return engine, True
 
+    # Elo limiting
     if sf_elo is not None and "UCI_LimitStrength" in opts and "UCI_Elo" in opts:
         elo_opt = opts["UCI_Elo"]
         min_elo = getattr(elo_opt, "min", 1320)
@@ -997,9 +894,10 @@ def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int
         except Exception as e:
             print(f"[SF] Failed Elo config {cfg}: {e}")
 
+    # Skill Level fallback
     if "Skill Level" in opts:
         if sf_skill is None:
-            sf_skill = 0
+            sf_skill = 0  # easiest
         skill = max(0, min(20, int(sf_skill)))
         cfg = {"Skill Level": skill}
         try:
@@ -1021,7 +919,7 @@ def game_vs_stockfish(
 ):
     """
     Play one game vs Stockfish. Returns (labeled_positions, result_from_our_pov).
-    Uses 1-ply NN-only move selection for our moves.
+    Labeled positions include weight=1.0 (no Elo here).
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return [], 0.0
@@ -1080,6 +978,9 @@ def backprop_step(optimizer, batch_size: int = 512):
     One explicit backpropagation step:
       - Sample a mini-batch from the replay buffer
       - Compute weighted MSE loss between NN predictions and target values
+        using Elo-based sample weights:
+            loss = mean( weight_i * (pred_i - y_i)^2 )
+      - Backpropagate gradients and update weights
     """
     if MODEL is None or REPLAY is None or len(REPLAY) == 0:
         return None
@@ -1089,11 +990,12 @@ def backprop_step(optimizer, batch_size: int = 512):
     preds = MODEL(xs)
     loss_vec = (preds - ys) ** 2
 
+    # Normalize weights so their mean is ~1, so LR stays sane
     ws = ws / (ws.mean() + 1e-8)
     loss = (ws * loss_vec).mean()
 
     optimizer.zero_grad()
-    loss.backward()
+    loss.backward()   # <-- backpropagation happens here
     optimizer.step()
     MODEL.eval()
     return float(loss.item())
@@ -1156,7 +1058,14 @@ def train_forever(
     selfplay_games_per_cycle: int = 10,
 ):
     """
-    Main training driver (unchanged logic, 1-ply move selection).
+    Main training driver.
+    - Load supervised data once into replay (Elo-weighted).
+    - Infinite cycles:
+        - many self-play games
+        - a few games vs Stockfish
+        - multiple backprop_step() calls per cycle
+    - Periodically runs an Elo ladder.
+    - Ctrl-C to stop; final/best model saved.
     """
     if not TORCH_AVAILABLE or CnnValueNet is None:
         print("[TRAIN] Torch or CNN not available, cannot train.")
@@ -1170,21 +1079,11 @@ def train_forever(
             return
 
     optimizer = torch.optim.Adam(MODEL.parameters(), lr=base_lr, weight_decay=1e-4)
-    try:
-        sig = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
-        if "verbose" in sig.parameters:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=5, verbose=True
-            )
-        else:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=5
-            )
-    except Exception:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5
-        )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, verbose=True
+    )
 
+    # Supervised data
     data = load_all_datasets(dataset_folder, max_dataset_positions)
     if data:
         random.shuffle(data)
@@ -1205,9 +1104,11 @@ def train_forever(
         with torch.no_grad():
             xs, ys, ws = REPLAY.sample(min(num_samples, len(REPLAY)))
             preds = MODEL(xs)
+            # approximate validation: ignore weights here, it's just a metric
             loss = F.mse_loss(preds, ys)
         return float(loss.item())
 
+    # Stockfish engine for training games
     sf_engine, sf_ok = create_stockfish_engine(sf_elo=1000)
 
     try:
@@ -1227,7 +1128,7 @@ def train_forever(
 
             # --- Games vs Stockfish ---
             if sf_ok and sf_engine is not None:
-                for i in range(2):
+                for i in range(2):  # two games per cycle (white & black)
                     color = chess.WHITE if i % 2 == 0 else chess.BLACK
                     pos_sf, res = game_vs_stockfish(sf_engine, our_color=color)
                     if REPLAY is not None:
@@ -1255,9 +1156,11 @@ def train_forever(
                     print(f"[TRAIN] New best model saved at {BEST_MODEL_PATH} "
                           f"(loss={val_like_loss:.6f})")
 
+            # --- Periodic Elo ladder ---
             if total_selfplay_games % EVAL_LADDER_INTERVAL_GAMES == 0:
                 run_stockfish_elo_ladder()
 
+            # Save current model each cycle as a safety net
             torch.save(MODEL.state_dict(), MODEL_PATH)
             print(f"[TRAIN] Saved current model to {MODEL_PATH}")
 
@@ -1265,6 +1168,7 @@ def train_forever(
         print("\n[TRAIN] Training interrupted by user (Ctrl-C). Saving final model...")
 
     finally:
+        # Close Stockfish
         if sf_engine is not None:
             try:
                 sf_engine.quit()
@@ -1272,6 +1176,7 @@ def train_forever(
             except Exception:
                 pass
 
+        # Save best / last model
         if best_state is not None:
             torch.save(best_state, MODEL_PATH)
             print(f"[TRAIN] Saved best-so-far model to {MODEL_PATH}.")
@@ -1288,9 +1193,10 @@ if __name__ == "__main__":
     if not TORCH_AVAILABLE or CnnValueNet is None:
         print("[TRAIN] Torch/CNN not available — cannot train.")
     else:
+        # This will run until you hit Ctrl-C.
         train_forever(
             dataset_folder="datasets",
-            max_dataset_positions=None,
+            max_dataset_positions=None,   # or an int if you want to cap
             batch_size=512,
             base_lr=1e-3,
             selfplay_games_per_cycle=10,
