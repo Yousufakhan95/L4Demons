@@ -74,7 +74,7 @@ EVAL_LADDER_INTERVAL_GAMES = 20  # run ladder every N self-play games
 # Base depth for online play (you can tweak this):
 BASE_SEARCH_DEPTH = 2          # starting point
 MIN_SEARCH_DEPTH = 1          # clamp
-MAX_SEARCH_DEPTH = 4           # clamp
+MAX_SEARCH_DEPTH = 3           # clamp
 
 SELFPLAY_DEPTH = 2             # depth in self-play for speed
 TRAIN_SEARCH_DEPTH = 3         # depth vs Stockfish in training
