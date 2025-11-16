@@ -73,8 +73,8 @@ EVAL_LADDER_INTERVAL_GAMES = 20  # run ladder every N self-play games
 # ---------------------------
 # Base depth for online play (you can tweak this):
 BASE_SEARCH_DEPTH = 2          # starting point
-MIN_SEARCH_DEPTH = 1          # clamp
-MAX_SEARCH_DEPTH = 3           # clamp
+MIN_SEARCH_DEPTH = 2          # clamp
+MAX_SEARCH_DEPTH = 2           # clamp
 
 SELFPLAY_DEPTH = 2             # depth in self-play for speed
 TRAIN_SEARCH_DEPTH = 3         # depth vs Stockfish in training
@@ -327,23 +327,6 @@ def get_dynamic_depth(board: chess.Board) -> int:
       - Clamp between MIN_SEARCH_DEPTH and MAX_SEARCH_DEPTH
     """
     depth = BASE_SEARCH_DEPTH
-
-    phase_pawns = estimate_material_phase(board)  # ~32 at start
-    moves = board.fullmove_number
-    in_check = board.is_check()
-
-    # Later game or low material → think deeper
-    if moves >= 25 or phase_pawns <= 18:
-        depth += 1
-    if moves >= 40 or phase_pawns <= 12:
-        depth += 1
-
-    # If the side to move is in check, push a little deeper
-    if in_check:
-        depth += 1
-
-    # Clamp
-    depth = max(MIN_SEARCH_DEPTH, min(MAX_SEARCH_DEPTH, depth))
     return depth
 
 
