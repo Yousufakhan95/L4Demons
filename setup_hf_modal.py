@@ -1,0 +1,41 @@
+"""
+Quick script to set up HuggingFace for Modal training.
+
+Just run this after getting your HuggingFace token.
+"""
+
+print("=" * 60)
+print("HuggingFace Setup for Modal Training")
+print("=" * 60)
+print()
+print("Step 1: Get your HuggingFace token")
+print("   → Go to: https://huggingface.co/settings/tokens")
+print("   → Click 'New token'")
+print("   → Type: Write")
+print("   → Copy the token (starts with hf_)")
+print()
+print("Step 2: Create Modal secret")
+print("   Run this command in your terminal:")
+print()
+print("   modal secret create huggingface-secret HF_TOKEN=YOUR_TOKEN_HERE")
+print()
+print("   Replace YOUR_TOKEN_HERE with your actual token")
+print()
+print("Step 3: Verify")
+print("   Run: modal secret list")
+print("   Should see: huggingface-secret")
+print()
+print("Step 4: Create HuggingFace repository")
+print("   → Go to: https://huggingface.co/new")
+print("   → Owner: yousufakhan")
+print("   → Name: L4Demons")
+print("   → Make it public")
+print("   → Click 'Create model'")
+print()
+print("Step 5: Start training!")
+print("   modal run train_modal.py")
+print()
+print("=" * 60)
+print("That's it! No local login needed for Modal training.")
+print("=" * 60)
+
