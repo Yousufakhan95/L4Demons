@@ -1,8 +1,9 @@
 # ============================================================
 #  CNN-BASED CHESSHACKS BOT + TRAINING ENGINE (DYNAMIC DEPTH)
 #  - CNN value net over 8x8 planes
-#  - Negamax + alpha-beta + quiescence
+#  - Negamax + alpha-beta + quiescence + transposition table
 #  - Dynamic search depth for actual games
+#  - Pondering on opponent's time
 #  - Supervised training from PGN/CSV with Elo weighting
 #  - Self-play + games vs Stockfish
 #  - Explicit backprop_step() for training (Ctrl-C to stop)
@@ -20,6 +21,10 @@ import csv
 import numpy as np
 from typing import Optional, List, Tuple
 import concurrent.futures
+import inspect
+import shutil
+import sys
+import threading  # for pondering
 
 # ============================================================
 #  TORCH SETUP
@@ -53,13 +58,46 @@ FEATURE_DIM = NUM_PLANES * BOARD_SIZE * BOARD_SIZE + 4
 
 MODEL = None
 DEVICE = "cuda"
-MODEL_PATH = os.path.join(ROOT_DIR,"src", "weights", "model.pt")
-BEST_MODEL_PATH = os.path.join(ROOT_DIR, "src", "weights", "model_best.pt")
+MODEL_PATH = os.path.join(ROOT_DIR, "src","weights", "model.pt")
+BEST_MODEL_PATH = os.path.join(ROOT_DIR,"src", "weights", "model_best.pt")
 
 # ---------------------------
 # Stockfish config
 # ---------------------------
-STOCKFISH_PATH = os.path.join(ROOT_DIR, "engines", "stockfish.exe")
+def find_stockfish():
+    """Return a sensible Stockfish executable path for this environment.
+
+    Order of preference:
+      1. Bundled engine in `engines/` (try common names)
+      2. System `stockfish` found via PATH
+      3. Common Unix locations (/usr/bin, /usr/local/bin)
+      4. Fallback to `engines/stockfish` (may be replaced by user)
+    """
+    engines_dir = os.path.join(ROOT_DIR, "engines")
+    candidates = [
+        os.path.join(engines_dir, "stockfish"),
+        os.path.join(engines_dir, "stockfish.exe"),
+        os.path.join(engines_dir, "stockfish-linux"),
+        os.path.join(engines_dir, "stockfish_14"),
+        os.path.join(engines_dir, "stockfish_15"),
+    ]
+
+    for p in candidates:
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+
+    which_sf = shutil.which("stockfish")
+    if which_sf:
+        return which_sf
+
+    for p in ["/usr/bin/stockfish", "/usr/local/bin/stockfish", "/root/project/engines/stockfish"]:
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+
+    return os.path.join(engines_dir, "stockfish")
+
+
+STOCKFISH_PATH = find_stockfish()
 STOCKFISH_TIME_LIMIT = 0.03  # seconds per move for training/eval
 STOCKFISH_MAX_MOVES = 200
 
@@ -71,13 +109,13 @@ EVAL_LADDER_INTERVAL_GAMES = 20  # run ladder every N self-play games
 # ---------------------------
 # Search config
 # ---------------------------
-# Base depth for online play (you can tweak this):
-BASE_SEARCH_DEPTH = 2          # starting point
-MIN_SEARCH_DEPTH = 2          # clamp
-MAX_SEARCH_DEPTH = 2           # clamp
+# With no memory limit, we can afford deeper search.
+BASE_SEARCH_DEPTH = 3          # starting point
+MIN_SEARCH_DEPTH = 2           # clamp
+MAX_SEARCH_DEPTH = 3           # clamp
 
-SELFPLAY_DEPTH = 2             # depth in self-play for speed
-TRAIN_SEARCH_DEPTH = 3         # depth vs Stockfish in training
+SELFPLAY_DEPTH = 3             # depth in self-play
+TRAIN_SEARCH_DEPTH = 4         # depth vs Stockfish in training
 
 # ---------------------------
 # Data config
@@ -87,8 +125,6 @@ MIN_FULLMOVES_FOR_PGN_LABEL = 10  # start labeling after move 10
 # ---------------------------
 # Elo weighting config
 # ---------------------------
-# Average Elo between players is mapped to a [0.1, 1.0] weight.
-# Below MIN_AVG_ELO_FOR_WEIGHT → use 0.1; above MAX → use 1.0.
 MIN_AVG_ELO_FOR_WEIGHT = 1400
 MAX_AVG_ELO_FOR_WEIGHT = 2400
 
@@ -135,14 +171,14 @@ def board_to_tensor(board: chess.Board):
 
 
 # ============================================================
-#  CNN VALUE NETWORK
+#  CNN VALUE NETWORK (BEEFED UP)
 # ============================================================
 
 if TORCH_AVAILABLE and nn is not None:
 
     class CnnValueNet(nn.Module):
         """
-        CNN over board planes + small dense head with extra meta features.
+        CNN over board planes + dense head with extra meta features.
         Input: flat vector length FEATURE_DIM
         Output: scalar value in [-1, 1] from White's POV for given board.
         """
@@ -153,17 +189,17 @@ if TORCH_AVAILABLE and nn is not None:
             self.board_vec_dim = board_vec_dim
             self.meta_dim = input_dim - board_vec_dim  # should be 4
 
-            # Convolutional trunk over 8x8 planes
-            self.conv1 = nn.Conv2d(num_planes, 32, kernel_size=3, padding=1)
-            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-            self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+            # Wider convolutional trunk
+            self.conv1 = nn.Conv2d(num_planes, 64, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+            self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
 
-            conv_output_dim = 64 * BOARD_SIZE * BOARD_SIZE  # 64 channels * 8 * 8
+            conv_output_dim = 128 * BOARD_SIZE * BOARD_SIZE  # 128 channels * 8 * 8
 
-            self.fc1 = nn.Linear(conv_output_dim + self.meta_dim, 512)
-            self.fc2 = nn.Linear(512, 128)
-            self.fc_out = nn.Linear(128, 1)
-            self.dropout = nn.Dropout(0.2)
+            self.fc1 = nn.Linear(conv_output_dim + self.meta_dim, 1024)
+            self.fc2 = nn.Linear(1024, 512)
+            self.fc_out = nn.Linear(512, 1)
+            self.dropout = nn.Dropout(0.25)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             # x: [batch, FEATURE_DIM]
@@ -208,7 +244,6 @@ def init_model():
     if os.path.exists(MODEL_PATH):
         try:
             state = torch.load(MODEL_PATH, map_location=DEVICE)
-            # Allow older formats that might wrap state dict
             if isinstance(state, dict) and "model_state_dict" in state:
                 state = state["model_state_dict"]
             MODEL.load_state_dict(state)
@@ -291,7 +326,6 @@ def evaluate_position(board: chess.Board) -> float:
         x = x.to(DEVICE).unsqueeze(0)
         v = MODEL(x)[0].item()  # NN output in [-1, 1]
 
-    # Blend weights. You can tune these.
     ALPHA = 0.2  # classical
     BETA = 0.8   # CNN
 
@@ -310,29 +344,43 @@ def estimate_material_phase(board: chess.Board) -> float:
     total_cp = 0
     for _, piece in board.piece_map().items():
         total_cp += PIECE_VALUES.get(piece.piece_type, 0)
-    # pawns-equivalent
     return total_cp / 100.0
 
 
 def get_dynamic_depth(board: chess.Board) -> int:
     """
     Dynamic depth for actual dashboard games.
-
-    Heuristics:
-      - Start from BASE_SEARCH_DEPTH
-      - Increase depth in:
-          * Endgames (low material)
-          * Later in the game (fullmove_number big)
-          * When side to move is in check (tactical)
-      - Clamp between MIN_SEARCH_DEPTH and MAX_SEARCH_DEPTH
     """
     depth = BASE_SEARCH_DEPTH
+
+    phase_pawns = estimate_material_phase(board)  # ~32 at start
+    moves = board.fullmove_number
+    in_check = board.is_check()
+
+    # Later game or low material → think deeper
+    if moves >= 20 or phase_pawns <= 20:
+        depth += 1
+    if moves >= 40 or phase_pawns <= 12:
+        depth += 1
+
+    if in_check:
+        depth += 1
+
+    depth = max(MIN_SEARCH_DEPTH, min(MAX_SEARCH_DEPTH, depth))
     return depth
 
 
 # ============================================================
-#  NEGAMAX + ALPHA-BETA + QUIESCENCE
+#  NEGAMAX + ALPHA-BETA + QUIESCENCE + TT
 # ============================================================
+
+# Simple transposition table:
+# key -> (depth, score, flag)
+# flag ∈ {"EXACT", "LOWER", "UPPER"}
+TT = {}
+TT_HITS = 0
+TT_MISSES = 0
+
 
 def softmax(scores: List[float]) -> List[float]:
     if not scores:
@@ -345,11 +393,11 @@ def softmax(scores: List[float]) -> List[float]:
     return [e / total for e in exps]
 
 
-def quiescence(board: chess.Board, alpha: float, beta: float, depth_cap: int = 4) -> float:
+def quiescence(board: chess.Board, alpha: float, beta: float, depth_cap: int = 6) -> float:
     """
-    Very small quiescence search:
+    Quiescence search:
       - Only explore capture moves (and promotions)
-      - Limit depth to avoid explosion.
+      - Slightly deeper now since we aren't memory-bound.
     """
     stand_pat = evaluate_position(board)
     if stand_pat >= beta:
@@ -377,14 +425,44 @@ def quiescence(board: chess.Board, alpha: float, beta: float, depth_cap: int = 4
 
 def negamax(board: chess.Board, depth: int, alpha: float, beta: float) -> float:
     """
-    Negamax with alpha-beta pruning and quiescence at leaf nodes.
+    Negamax with alpha-beta pruning, quiescence, and a transposition table.
+    Scores are always from POV of side to move.
     """
+    global TT_HITS, TT_MISSES
+
     if depth == 0 or board.is_game_over():
         return quiescence(board, alpha, beta)
 
+    key = None
+    if hasattr(board, "transposition_key"):
+        try:
+            key = board.transposition_key()
+        except Exception:
+            key = None
+
+    orig_alpha = alpha
+
+    if key is not None:
+        entry = TT.get(key)
+        if entry is not None:
+            TT_HITS += 1
+            entry_depth, entry_score, entry_flag = entry
+            if entry_depth >= depth:
+                if entry_flag == "EXACT":
+                    return entry_score
+                elif entry_flag == "LOWER":
+                    alpha = max(alpha, entry_score)
+                elif entry_flag == "UPPER":
+                    beta = min(beta, entry_score)
+                if alpha >= beta:
+                    return entry_score
+        else:
+            TT_MISSES += 1
+
     max_eval = -float("inf")
     legal_moves = list(board.generate_legal_moves())
-    # Optional: simple move ordering (captures first)
+
+    # Simple move ordering: captures first
     legal_moves.sort(key=lambda m: board.is_capture(m), reverse=True)
 
     for move in legal_moves:
@@ -400,6 +478,16 @@ def negamax(board: chess.Board, depth: int, alpha: float, beta: float) -> float:
         if alpha >= beta:
             break  # cutoff
 
+    # Store in TT
+    if key is not None:
+        if max_eval <= orig_alpha:
+            flag = "UPPER"
+        elif max_eval >= beta:
+            flag = "LOWER"
+        else:
+            flag = "EXACT"
+        TT[key] = (depth, max_eval, flag)
+
     return max_eval
 
 
@@ -410,10 +498,6 @@ def choose_move_with_search(
 ):
     """
     Use negamax + alpha-beta to pick the best move.
-
-    If depth is None:
-      - For *actual games* (dashboard), we call this with depth=None and
-        dynamically compute depth with get_dynamic_depth(board).
     """
     if not legal_moves:
         return None, {}
@@ -446,6 +530,107 @@ def choose_move_with_search(
 
 
 # ============================================================
+#  PONDERING (THINK ON OPPONENT'S TIME)
+# ============================================================
+
+# Cache: board_fen -> best_move we computed while pondering.
+PONDER_CACHE = {}
+PONDER_LOCK = threading.Lock()
+PONDER_THREAD: Optional[threading.Thread] = None
+PONDER_STOP = threading.Event()
+
+
+def _board_key(board: chess.Board) -> str:
+    return board.fen()
+
+
+def _ponder_set_result(board_fen: str, move: Move):
+    with PONDER_LOCK:
+        # You can grow this more if you want; it's just RAM now.
+        if len(PONDER_CACHE) > 4096:
+            PONDER_CACHE.clear()
+        PONDER_CACHE[board_fen] = move
+
+
+def _ponder_get_move(board: chess.Board) -> Optional[Move]:
+    key = _board_key(board)
+    with PONDER_LOCK:
+        return PONDER_CACHE.get(key)
+
+
+def stop_pondering():
+    """Signal current ponder thread to stop (if any)."""
+    global PONDER_THREAD
+    PONDER_STOP.set()
+    if PONDER_THREAD is not None and PONDER_THREAD.is_alive():
+        try:
+            PONDER_THREAD.join(timeout=0.02)
+        except Exception:
+            pass
+    PONDER_THREAD = None
+    PONDER_STOP.clear()
+
+
+def _ponder_worker(root_fen: str):
+    """
+    Background worker:
+      - root_fen: position AFTER our move (opponent to move).
+      - For each opponent reply, compute our best move in that line and cache it.
+    """
+    try:
+        root = chess.Board(root_fen)
+    except Exception as e:
+        print("[PONDER] Failed to init board from fen:", e)
+        return
+
+    opp_moves = list(root.generate_legal_moves())
+    for opp_move in opp_moves:
+        if PONDER_STOP.is_set():
+            break
+
+        child = root.copy()
+        child.push(opp_move)  # now it's our turn
+
+        legal = list(child.generate_legal_moves())
+        if not legal:
+            continue
+
+        # Slightly DEEPER search while pondering (if possible).
+        try:
+            ponder_depth = min(MAX_SEARCH_DEPTH + 1, 6)
+            reply, _ = choose_move_with_search(child, legal_moves=legal, depth=ponder_depth)
+        except Exception as e:
+            print("[PONDER] Error during ponder search:", e)
+            continue
+
+        if reply is None:
+            continue
+
+        _ponder_set_result(child.fen(), reply)
+
+
+def start_pondering_from(board_after_our_move: chess.Board):
+    """
+    Start a background ponder thread from 'board_after_our_move', which
+    should be the position RIGHT AFTER we make our move (opponent to move).
+    """
+    if not TORCH_AVAILABLE or MODEL is None:
+        return
+
+    stop_pondering()
+    fen = board_after_our_move.fen()
+
+    global PONDER_THREAD
+    PONDER_THREAD = threading.Thread(
+        target=_ponder_worker,
+        args=(fen,),
+        daemon=True,
+    )
+    PONDER_STOP.clear()
+    PONDER_THREAD.start()
+
+
+# ============================================================
 #  CHESSHACKS ENTRYPOINTS (ACTUAL GAMES)
 # ============================================================
 
@@ -456,16 +641,34 @@ def test_func(ctx: GameContext):
 
     - Uses dynamic depth for search (get_dynamic_depth).
     - Depth scales with phase of game + checks.
+    - Uses pondering results if available.
     """
+    # Stop any previous pondering (but keep cache).
+    stop_pondering()
+
     legal_moves = list(ctx.board.generate_legal_moves())
     if not legal_moves:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available.")
 
-    # depth=None → use dynamic depth
-    move, prob_map = choose_move_with_search(ctx.board, legal_moves, depth=None)
-    ctx.logProbabilities(prob_map)
-    return move
+    # 1) If we already pondered this exact position, use that.
+    cached_move = _ponder_get_move(ctx.board)
+    if cached_move is not None and cached_move in legal_moves:
+        probs = {m: (1.0 if m == cached_move else 0.0) for m in legal_moves}
+        ctx.logProbabilities(probs)
+        chosen_move = cached_move
+    else:
+        # 2) Normal search.
+        chosen_move, prob_map = choose_move_with_search(ctx.board, legal_moves, depth=None)
+        ctx.logProbabilities(prob_map)
+
+    # 3) After deciding on our move, start pondering from the
+    #    new position (opponent to move) in a background thread.
+    board_after = ctx.board.copy()
+    board_after.push(chosen_move)
+    start_pondering_from(board_after)
+
+    return chosen_move
 
 
 @chess_manager.reset
@@ -473,7 +676,9 @@ def reset_func(ctx: GameContext):
     """
     Called when a new game starts.
     """
-    pass
+    stop_pondering()
+    with PONDER_LOCK:
+        PONDER_CACHE.clear()
 
 
 # ============================================================
@@ -497,7 +702,7 @@ def compute_elo_weight(avg_elo: Optional[float]) -> float:
     Map average Elo to a weight in [0.1, 1.0].
     - If Elo is unknown → 1.0
     - Below MIN_AVG_ELO_FOR_WEIGHT → 0.1
-    - Above MAX_AVG_ELO_FOR_WEIGHT → 1.0
+    - Above MAX → 1.0
     - Linear in between.
     """
     if avg_elo is None:
@@ -552,7 +757,6 @@ def load_pgn_dataset(path: str, max_positions: Optional[int] = None):
 
             headers = game.headers
 
-            # Try to fetch Elo from typical PGN tags
             w_elo = (
                 elo_str_to_int(headers.get("WhiteElo"))
                 or elo_str_to_int(headers.get("WhiteRating"))
@@ -624,7 +828,6 @@ def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # winner
             winner = row.get("winner", "").strip().lower()
             if winner == "white":
                 winner_color = chess.WHITE
@@ -633,7 +836,6 @@ def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
             else:
                 winner_color = None
 
-            # Try a few common rating column names
             w_elo = (
                 elo_str_to_int(row.get("white_elo"))
                 or elo_str_to_int(row.get("white_rating"))
@@ -711,12 +913,12 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
     pgn_files = [f for f in files if f.lower().endswith(".pgn")]
     csv_files = [f for f in files if f.lower().endswith(".csv")]
 
-    all_positions: List[Tuple[torch.Tensor, float, float]] = []
+    all_positions: List[Tuple] = []
 
     # Parallel PGN loading
     if pgn_files:
-        print(f"[DATA] Parallel loading {len(pgn_files)} PGN files...")
         total = len(pgn_files)
+        print(f"[DATA] Parallel loading {total} PGN files...")
         completed = 0
 
         if max_positions is not None:
@@ -724,29 +926,94 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
         else:
             per_file_limit = None
 
-        with concurrent.futures.ThreadPoolExecutor() as ex:
+        max_workers = min(8, max(1, os.cpu_count() or 1))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {}
             for f_name in pgn_files:
                 path = os.path.join(folder, f_name)
                 futures[ex.submit(load_pgn_dataset, path, per_file_limit)] = f_name
 
-            for fut in concurrent.futures.as_completed(futures):
-                fname = futures[fut]
-                try:
-                    pos = fut.result()
-                    all_positions.extend(pos)
-                    print(f"[DATA] PGN {fname}: {len(pos)} positions")
-                except Exception as e:
-                    print(f"[DATA] Failed to load PGN {fname}: {e}")
+            pending = set(futures.keys())
+            try:
+                idle_rounds = 0
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        timeout=60,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        idle_rounds += 1
+                        print("[DATA] Warning: no PGN finished within 60s; checking pending tasks...")
+                        if idle_rounds >= 3:
+                            stalled = [futures.get(fut, '<unknown>') for fut in pending]
+                            print(f"[DATA] Warning: parallel loading appears stalled. Stalled files: {stalled}")
+                            break
+                        continue
 
-                completed += 1
-                print(f"[DATA] PGN progress: {completed}/{total}")
+                    idle_rounds = 0
+                    for fut in list(done):
+                        fname = futures.get(fut, "<unknown>")
+                        try:
+                            pos = fut.result(timeout=5)
+                            all_positions.extend(pos)
+                            print(f"[DATA] PGN {fname}: {len(pos)} positions")
+                        except Exception as e:
+                            print(f"[DATA] Failed to load PGN {fname}: {e}")
 
-                if max_positions is not None and len(all_positions) >= max_positions:
-                    all_positions = all_positions[:max_positions]
-                    print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
-                    csv_files = []
-                    break
+                        completed += 1
+                        print(f"[DATA] PGN progress: {completed}/{total}")
+
+                        if max_positions is not None and len(all_positions) >= max_positions:
+                            all_positions = all_positions[:max_positions]
+                            print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
+                            pending.clear()
+                            break
+
+                if pending:
+                    print(f"[DATA] Falling back to sequential load for {len(pending)} pending PGN(s).")
+                    for fut in list(pending):
+                        fname = futures.get(fut, "<unknown>")
+                        try:
+                            path = os.path.join(folder, fname)
+                        except Exception:
+                            path = None
+
+                        try:
+                            fut.cancel()
+                        except Exception:
+                            pass
+
+                        if path and os.path.exists(path):
+                            try:
+                                pos = load_pgn_dataset(path, per_file_limit)
+                                all_positions.extend(pos)
+                                print(f"[DATA] (sequential) PGN {fname}: {len(pos)} positions")
+                            except Exception as e:
+                                print(f"[DATA] (sequential) Failed to load PGN {fname}: {e}")
+                        else:
+                            print(f"[DATA] Could not determine path for stalled PGN {fname}; skipping.")
+
+                        completed += 1
+                        print(f"[DATA] PGN progress: {completed}/{total}")
+
+                        if max_positions is not None and len(all_positions) >= max_positions:
+                            all_positions = all_positions[:max_positions]
+                            print(f"[DATA] Reached max_positions={max_positions} from PGNs.")
+                            break
+            except KeyboardInterrupt:
+                print("[DATA] Loading interrupted by user.")
+            except Exception as e:
+                print(f"[DATA] Unexpected error during parallel PGN loading: {e}")
+                for fut in list(pending):
+                    try:
+                        fname = futures.get(fut, "<unknown>")
+                        pos = fut.result(timeout=1)
+                        all_positions.extend(pos)
+                        print(f"[DATA] PGN {fname}: {len(pos)} positions (late)")
+                    except Exception:
+                        pass
+                pending.clear()
 
     # CSV loading
     for f_name in csv_files:
@@ -768,10 +1035,10 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
 if TORCH_AVAILABLE and CnnValueNet is not None:
 
     class ReplayBuffer:
-        def __init__(self, cap: int = 500_000):
+        def __init__(self, cap: int = 1_000_000):
             self.cap = cap
             # store (x, y, weight)
-            self.data: List[Tuple[torch.Tensor, float, float]] = []
+            self.data = []
 
         def add(self, x, y, weight: float = 1.0):
             if len(self.data) >= self.cap:
@@ -783,7 +1050,6 @@ if TORCH_AVAILABLE and CnnValueNet is not None:
                 if len(item) == 3:
                     x, y, w = item
                 else:
-                    # backward compatibility if something passes (x, y)
                     x, y = item
                     w = 1.0
                 self.add(x, y, w)
@@ -812,13 +1078,9 @@ def choose_move_for_selfplay(board: Board, depth: int) -> Optional[Move]:
     return move
 
 
-def self_play_game(max_moves: int = 300, depth: int = SELFPLAY_DEPTH):
+def self_play_game(max_moves: int = 600, depth: int = SELFPLAY_DEPTH):
     """
     Self-play game with the current MODEL.
-
-    We "backpropagate" the game result to all positions in the trajectory:
-      - For each position we store (x, y, 1.0) where y is +1/-1/0 from POV of
-        side to move in that position.
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return []
@@ -839,6 +1101,18 @@ def self_play_game(max_moves: int = 300, depth: int = SELFPLAY_DEPTH):
         board.push(mv)
 
     res = board.result(claim_draw=True)
+    try:
+        plies = len(board.move_stack)
+        fullmoves = plies // 2
+        outcome = board.outcome(claim_draw=True)
+        if outcome is not None:
+            term = getattr(outcome, "termination", None)
+            winner = getattr(outcome, "winner", None)
+            print(f"[SELFPLAY] Finished: plies={plies}, fullmoves={fullmoves}, termination={term}, winner={winner}")
+        else:
+            print(f"[SELFPLAY] Finished: plies={plies}, fullmoves={fullmoves}, result={res}")
+    except Exception as _e:
+        print(f"[SELFPLAY] Finished: could not compute outcome details: {_e}")
     if res == "1-0":
         w, b = 1.0, -1.0
     elif res == "0-1":
@@ -854,10 +1128,7 @@ def self_play_game(max_moves: int = 300, depth: int = SELFPLAY_DEPTH):
 
 def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int] = None):
     """
-    Launch Stockfish with optional strength limiting via:
-      - UCI_LimitStrength + UCI_Elo (preferred)
-      - Skill Level (0–20)
-    Returns (engine, ok_flag).
+    Launch Stockfish with optional strength limiting.
     """
     if not os.path.exists(STOCKFISH_PATH):
         print(f"[SF] Stockfish not found at: {STOCKFISH_PATH}")
@@ -867,7 +1138,25 @@ def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int
         engine = chess.engine.SimpleEngine.popen_uci([STOCKFISH_PATH])
         print("[SF] Stockfish engine started.")
     except Exception as e:
-        print(f"[SF] Error launching Stockfish: {e}")
+        print(f"[SF] Error launching Stockfish at {STOCKFISH_PATH}: {e}")
+        try:
+            alt = shutil.which("stockfish")
+            if alt and alt != STOCKFISH_PATH:
+                engine = chess.engine.SimpleEngine.popen_uci([alt])
+                print(f"[SF] Stockfish engine started via PATH at {alt}.")
+                return engine, True
+        except Exception as e2:
+            print(f"[SF] Fallback via PATH failed: {e2}")
+
+        alt2 = os.path.join(os.path.dirname(STOCKFISH_PATH), "stockfish")
+        if os.path.exists(alt2) and os.access(alt2, os.X_OK):
+            try:
+                engine = chess.engine.SimpleEngine.popen_uci([alt2])
+                print(f"[SF] Stockfish engine started via bundled path {alt2}.")
+                return engine, True
+            except Exception as e3:
+                print(f"[SF] Fallback via bundled path failed: {e3}")
+
         return None, False
 
     try:
@@ -876,7 +1165,6 @@ def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int
         print(f"[SF] Could not read engine options: {e}")
         return engine, True
 
-    # Elo limiting
     if sf_elo is not None and "UCI_LimitStrength" in opts and "UCI_Elo" in opts:
         elo_opt = opts["UCI_Elo"]
         min_elo = getattr(elo_opt, "min", 1320)
@@ -894,10 +1182,9 @@ def create_stockfish_engine(sf_elo: Optional[int] = 1000, sf_skill: Optional[int
         except Exception as e:
             print(f"[SF] Failed Elo config {cfg}: {e}")
 
-    # Skill Level fallback
     if "Skill Level" in opts:
         if sf_skill is None:
-            sf_skill = 0  # easiest
+            sf_skill = 0
         skill = max(0, min(20, int(sf_skill)))
         cfg = {"Skill Level": skill}
         try:
@@ -919,7 +1206,6 @@ def game_vs_stockfish(
 ):
     """
     Play one game vs Stockfish. Returns (labeled_positions, result_from_our_pov).
-    Labeled positions include weight=1.0 (no Elo here).
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return [], 0.0
@@ -978,9 +1264,6 @@ def backprop_step(optimizer, batch_size: int = 512):
     One explicit backpropagation step:
       - Sample a mini-batch from the replay buffer
       - Compute weighted MSE loss between NN predictions and target values
-        using Elo-based sample weights:
-            loss = mean( weight_i * (pred_i - y_i)^2 )
-      - Backpropagate gradients and update weights
     """
     if MODEL is None or REPLAY is None or len(REPLAY) == 0:
         return None
@@ -990,12 +1273,11 @@ def backprop_step(optimizer, batch_size: int = 512):
     preds = MODEL(xs)
     loss_vec = (preds - ys) ** 2
 
-    # Normalize weights so their mean is ~1, so LR stays sane
     ws = ws / (ws.mean() + 1e-8)
     loss = (ws * loss_vec).mean()
 
     optimizer.zero_grad()
-    loss.backward()   # <-- backpropagation happens here
+    loss.backward()
     optimizer.step()
     MODEL.eval()
     return float(loss.item())
@@ -1059,13 +1341,6 @@ def train_forever(
 ):
     """
     Main training driver.
-    - Load supervised data once into replay (Elo-weighted).
-    - Infinite cycles:
-        - many self-play games
-        - a few games vs Stockfish
-        - multiple backprop_step() calls per cycle
-    - Periodically runs an Elo ladder.
-    - Ctrl-C to stop; final/best model saved.
     """
     if not TORCH_AVAILABLE or CnnValueNet is None:
         print("[TRAIN] Torch or CNN not available, cannot train.")
@@ -1079,11 +1354,21 @@ def train_forever(
             return
 
     optimizer = torch.optim.Adam(MODEL.parameters(), lr=base_lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, verbose=True
-    )
+    try:
+        sig = inspect.signature(torch.optim.lr_scheduler.ReduceLROnPlateau)
+        if "verbose" in sig.parameters:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=5, verbose=True
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="min", factor=0.5, patience=5
+            )
+    except Exception:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5
+        )
 
-    # Supervised data
     data = load_all_datasets(dataset_folder, max_dataset_positions)
     if data:
         random.shuffle(data)
@@ -1104,11 +1389,9 @@ def train_forever(
         with torch.no_grad():
             xs, ys, ws = REPLAY.sample(min(num_samples, len(REPLAY)))
             preds = MODEL(xs)
-            # approximate validation: ignore weights here, it's just a metric
             loss = F.mse_loss(preds, ys)
         return float(loss.item())
 
-    # Stockfish engine for training games
     sf_engine, sf_ok = create_stockfish_engine(sf_elo=1000)
 
     try:
@@ -1128,7 +1411,7 @@ def train_forever(
 
             # --- Games vs Stockfish ---
             if sf_ok and sf_engine is not None:
-                for i in range(2):  # two games per cycle (white & black)
+                for i in range(2):
                     color = chess.WHITE if i % 2 == 0 else chess.BLACK
                     pos_sf, res = game_vs_stockfish(sf_engine, our_color=color)
                     if REPLAY is not None:
@@ -1137,7 +1420,7 @@ def train_forever(
                           f"{len(pos_sf)} positions, result={res}, replay={len(REPLAY)}")
 
             # --- Backprop steps ---
-            steps = max(10, selfplay_games_per_cycle * 5)
+            steps = max(20, selfplay_games_per_cycle * 8)
             last_loss = None
             for _ in range(steps):
                 last_loss = backprop_step(optimizer, batch_size=batch_size)
@@ -1156,11 +1439,9 @@ def train_forever(
                     print(f"[TRAIN] New best model saved at {BEST_MODEL_PATH} "
                           f"(loss={val_like_loss:.6f})")
 
-            # --- Periodic Elo ladder ---
             if total_selfplay_games % EVAL_LADDER_INTERVAL_GAMES == 0:
                 run_stockfish_elo_ladder()
 
-            # Save current model each cycle as a safety net
             torch.save(MODEL.state_dict(), MODEL_PATH)
             print(f"[TRAIN] Saved current model to {MODEL_PATH}")
 
@@ -1168,7 +1449,6 @@ def train_forever(
         print("\n[TRAIN] Training interrupted by user (Ctrl-C). Saving final model...")
 
     finally:
-        # Close Stockfish
         if sf_engine is not None:
             try:
                 sf_engine.quit()
@@ -1176,7 +1456,6 @@ def train_forever(
             except Exception:
                 pass
 
-        # Save best / last model
         if best_state is not None:
             torch.save(best_state, MODEL_PATH)
             print(f"[TRAIN] Saved best-so-far model to {MODEL_PATH}.")
@@ -1193,10 +1472,9 @@ if __name__ == "__main__":
     if not TORCH_AVAILABLE or CnnValueNet is None:
         print("[TRAIN] Torch/CNN not available — cannot train.")
     else:
-        # This will run until you hit Ctrl-C.
         train_forever(
             dataset_folder="datasets",
-            max_dataset_positions=None,   # or an int if you want to cap
+            max_dataset_positions=None,
             batch_size=512,
             base_lr=1e-3,
             selfplay_games_per_cycle=10,
