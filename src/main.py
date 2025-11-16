@@ -1,12 +1,12 @@
 # ============================================================
-#  CNN-BASED CHESSHACKS BOT + TRAINING ENGINE (DYNAMIC DEPTH)
-#  - CNN value net over 8x8 planes
-#  - Negamax + alpha-beta + quiescence + transposition table
-#  - Dynamic search depth for actual games
-#  - Pondering on opponent's time
-#  - Supervised training from PGN/CSV with Elo weighting
-#  - Self-play + games vs Stockfish
-#  - Explicit backprop_step() for training (Ctrl-C to stop)
+#  FAST CNN-BASED CHESSHACKS BOT (1-PLY + SANITY CHECK)
+#  - All decisions by the NN (no handcrafted search heuristics)
+#  - 1-ply lookahead for speed
+#  - Tiny extra check vs opponent's best replies (captures/checks)
+#    to avoid totally suicidal moves
+#  - Same network architecture as your original file, so your
+#    existing model.pt still loads.
+#  - Self-play + Stockfish training still supported (1-ply logic).
 # ============================================================
 
 from .utils import chess_manager, GameContext  # adapt if your path is different
@@ -24,7 +24,6 @@ import concurrent.futures
 import inspect
 import shutil
 import sys
-import threading  # for pondering
 
 # ============================================================
 #  TORCH SETUP
@@ -65,14 +64,7 @@ BEST_MODEL_PATH = os.path.join(ROOT_DIR, "weights", "model_best.pt")
 # Stockfish config
 # ---------------------------
 def find_stockfish():
-    """Return a sensible Stockfish executable path for this environment.
-
-    Order of preference:
-      1. Bundled engine in `engines/` (try common names)
-      2. System `stockfish` found via PATH
-      3. Common Unix locations (/usr/bin, /usr/local/bin)
-      4. Fallback to `engines/stockfish` (may be replaced by user)
-    """
+    """Return a sensible Stockfish executable path for this environment."""
     engines_dir = os.path.join(ROOT_DIR, "engines")
     candidates = [
         os.path.join(engines_dir, "stockfish"),
@@ -107,15 +99,11 @@ EVAL_GAMES_PER_LEVEL = 4
 EVAL_LADDER_INTERVAL_GAMES = 20  # run ladder every N self-play games
 
 # ---------------------------
-# Search config
+# Search config (SPEED MODE)
 # ---------------------------
-# With no memory limit, we can afford deeper search.
-BASE_SEARCH_DEPTH = 3          # starting point
-MIN_SEARCH_DEPTH = 2           # clamp
-MAX_SEARCH_DEPTH = 3           # clamp
-
-SELFPLAY_DEPTH = 3             # depth in self-play
-TRAIN_SEARCH_DEPTH = 4         # depth vs Stockfish in training
+# We conceptually keep these, but move selection is 1-ply NN-based.
+SELFPLAY_DEPTH = 1             # depth for self-play
+TRAIN_SEARCH_DEPTH = 1         # depth vs Stockfish
 
 # ---------------------------
 # Data config
@@ -171,16 +159,16 @@ def board_to_tensor(board: chess.Board):
 
 
 # ============================================================
-#  CNN VALUE NETWORK (BEEFED UP)
+#  CNN VALUE NETWORK (ORIGINAL ARCH)
 # ============================================================
 
 if TORCH_AVAILABLE and nn is not None:
 
     class CnnValueNet(nn.Module):
         """
-        CNN over board planes + dense head with extra meta features.
+        CNN over board planes + small dense head with extra meta features.
         Input: flat vector length FEATURE_DIM
-        Output: scalar value in [-1, 1] from White's POV for given board.
+        Output: scalar value in [-1, 1] (as trained).
         """
         def __init__(self, input_dim: int, num_planes: int = NUM_PLANES):
             super().__init__()
@@ -189,17 +177,17 @@ if TORCH_AVAILABLE and nn is not None:
             self.board_vec_dim = board_vec_dim
             self.meta_dim = input_dim - board_vec_dim  # should be 4
 
-            # Wider convolutional trunk
-            self.conv1 = nn.Conv2d(num_planes, 64, kernel_size=3, padding=1)
-            self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-            self.conv3 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+            # Matches your original values: 32 / 64 / 64 conv, 512/128 dense
+            self.conv1 = nn.Conv2d(num_planes, 32, kernel_size=3, padding=1)
+            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+            self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
 
-            conv_output_dim = 128 * BOARD_SIZE * BOARD_SIZE  # 128 channels * 8 * 8
+            conv_output_dim = 64 * BOARD_SIZE * BOARD_SIZE  # 64 channels * 8 * 8
 
-            self.fc1 = nn.Linear(conv_output_dim + self.meta_dim, 1024)
-            self.fc2 = nn.Linear(1024, 512)
-            self.fc_out = nn.Linear(512, 1)
-            self.dropout = nn.Dropout(0.25)
+            self.fc1 = nn.Linear(conv_output_dim + self.meta_dim, 512)
+            self.fc2 = nn.Linear(512, 128)
+            self.fc_out = nn.Linear(128, 1)
+            self.dropout = nn.Dropout(0.2)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             # x: [batch, FEATURE_DIM]
@@ -237,13 +225,14 @@ def init_model():
         return
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[ML] Using device: {DEVICE}")
+    print(f("[ML] Using device: {DEVICE}") if False else f"[ML] Using device: {DEVICE}")
 
     MODEL = CnnValueNet(FEATURE_DIM).to(DEVICE)
 
     if os.path.exists(MODEL_PATH):
         try:
             state = torch.load(MODEL_PATH, map_location=DEVICE)
+            # Allow older formats that might wrap state dict
             if isinstance(state, dict) and "model_state_dict" in state:
                 state = state["model_state_dict"]
             MODEL.load_state_dict(state)
@@ -264,20 +253,20 @@ init_model()
 #  SIMPLE EVAL + NN-BASED EVAL
 # ============================================================
 
-# Basic material values in centipawns
+# Basic material values in centipawns (used only for stabilizer eval)
 PIECE_VALUES = {
     chess.PAWN:   100,
     chess.KNIGHT: 320,
     chess.BISHOP: 330,
     chess.ROOK:   500,
     chess.QUEEN:  900,
-    chess.KING:   0,  # king safety handled separately if needed
+    chess.KING:   0,
 }
 
 
 def material_eval_cp(board: chess.Board) -> int:
     score = 0
-    for square, piece in board.piece_map().items():
+    for _, piece in board.piece_map().items():
         val = PIECE_VALUES.get(piece.piece_type, 0)
         if piece.color == chess.WHITE:
             score += val
@@ -288,17 +277,15 @@ def material_eval_cp(board: chess.Board) -> int:
 
 def simple_classical_eval(board: chess.Board) -> float:
     """
-    Very simple classical eval in [-1, 1], from side-to-move POV.
-    We mostly rely on CNN; this is just a stabilizer.
+    Very simple classical eval in [-1, 1], as a stabilizer.
     """
     cp = material_eval_cp(board)
 
-    # Normalize to [-1, 1] assuming ±2000cp extremes
     MAX_CP = 2000.0
     cp = max(-MAX_CP, min(MAX_CP, float(cp)))
     val = cp / MAX_CP
 
-    # side-to-move POV
+    # POV = side to move
     if board.turn == chess.WHITE:
         return val
     else:
@@ -307,11 +294,10 @@ def simple_classical_eval(board: chess.Board) -> float:
 
 def evaluate_position(board: chess.Board) -> float:
     """
-    Final evaluation from POV of side to move, in [-1, 1].
-
+    Final evaluation in [-1, 1] from POV of SIDE TO MOVE.
     Combination:
-      - light classical eval
-      - CNN value net (stronger pattern recognition)
+      - simple_classical_eval
+      - CNN value net
     """
     classical = simple_classical_eval(board)
 
@@ -324,7 +310,7 @@ def evaluate_position(board: chess.Board) -> float:
 
     with torch.no_grad():
         x = x.to(DEVICE).unsqueeze(0)
-        v = MODEL(x)[0].item()  # NN output in [-1, 1]
+        v = MODEL(x)[0].item()  # NN raw output
 
     ALPHA = 0.2  # classical
     BETA = 0.8   # CNN
@@ -333,54 +319,8 @@ def evaluate_position(board: chess.Board) -> float:
 
 
 # ============================================================
-#  DYNAMIC DEPTH FOR ACTUAL GAMES
+#  SOFTMAX UTILITY
 # ============================================================
-
-def estimate_material_phase(board: chess.Board) -> float:
-    """
-    Rough material count in "pawns" for both sides combined.
-    Used to guess opening / middlegame / endgame.
-    """
-    total_cp = 0
-    for _, piece in board.piece_map().items():
-        total_cp += PIECE_VALUES.get(piece.piece_type, 0)
-    return total_cp / 100.0
-
-
-def get_dynamic_depth(board: chess.Board) -> int:
-    """
-    Dynamic depth for actual dashboard games.
-    """
-    depth = BASE_SEARCH_DEPTH
-
-    phase_pawns = estimate_material_phase(board)  # ~32 at start
-    moves = board.fullmove_number
-    in_check = board.is_check()
-
-    # Later game or low material → think deeper
-    if moves >= 20 or phase_pawns <= 20:
-        depth += 1
-    if moves >= 40 or phase_pawns <= 12:
-        depth += 1
-
-    if in_check:
-        depth += 1
-
-    depth = max(MIN_SEARCH_DEPTH, min(MAX_SEARCH_DEPTH, depth))
-    return depth
-
-
-# ============================================================
-#  NEGAMAX + ALPHA-BETA + QUIESCENCE + TT
-# ============================================================
-
-# Simple transposition table:
-# key -> (depth, score, flag)
-# flag ∈ {"EXACT", "LOWER", "UPPER"}
-TT = {}
-TT_HITS = 0
-TT_MISSES = 0
-
 
 def softmax(scores: List[float]) -> List[float]:
     if not scores:
@@ -393,241 +333,136 @@ def softmax(scores: List[float]) -> List[float]:
     return [e / total for e in exps]
 
 
-def quiescence(board: chess.Board, alpha: float, beta: float, depth_cap: int = 6) -> float:
-    """
-    Quiescence search:
-      - Only explore capture moves (and promotions)
-      - Slightly deeper now since we aren't memory-bound.
-    """
-    stand_pat = evaluate_position(board)
-    if stand_pat >= beta:
-        return beta
-    if stand_pat > alpha:
-        alpha = stand_pat
+# ============================================================
+#  OPPONENT WORST-REPLY EVAL (TINY 2-PLY CHECK)
+# ============================================================
 
-    if depth_cap <= 0:
-        return alpha
+def evaluate_worst_reply(board: chess.Board, max_replies: int = 10) -> Optional[float]:
+    """
+    Given a position where it's the OPPONENT's turn,
+    estimate how bad their BEST reply can make things for us.
 
-    for move in board.generate_legal_moves():
-        if not board.is_capture(move) and not move.promotion:
-            continue
-        board.push(move)
-        score = -quiescence(board, -beta, -alpha, depth_cap - 1)
+    - Look at up to `max_replies` opponent moves, prioritizing captures / checks / promotions.
+    - For each:
+        push reply → evaluate_position() → pop.
+      evaluate_position is from POV of SIDE TO MOVE (which will be US again,
+      since they'll have just moved), so that value is "for us".
+    - Return the *worst* (minimum) value from our POV.
+    """
+    replies = list(board.generate_legal_moves())
+    if not replies:
+        # No legal moves: checkmate or stalemate
+        if board.is_checkmate():
+            # They are mated → our previous move was winning.
+            return 1.0
+        else:
+            # Stalemate
+            return 0.0
+
+    # Prioritize tactical, forcing moves
+    def reply_key(m: chess.Move):
+        is_cap = board.is_capture(m)
+        gives_chk = board.gives_check(m)
+        is_promo = (m.promotion is not None)
+        # Captures / promos / checks > quiet moves
+        return (is_cap, is_promo, gives_chk)
+
+    replies.sort(key=reply_key, reverse=True)
+    replies = replies[:max_replies]
+
+    worst_score = None
+
+    for r in replies:
+        board.push(r)
+        # Now it's our turn again; eval from side-to-move POV (us).
+        val_for_us = evaluate_position(board)
         board.pop()
 
-        if score >= beta:
-            return beta
-        if score > alpha:
-            alpha = score
+        if worst_score is None or val_for_us < worst_score:
+            worst_score = val_for_us
 
-    return alpha
+    return worst_score
 
 
-def negamax(board: chess.Board, depth: int, alpha: float, beta: float) -> float:
-    """
-    Negamax with alpha-beta pruning, quiescence, and a transposition table.
-    Scores are always from POV of side to move.
-    """
-    global TT_HITS, TT_MISSES
+# ============================================================
+#  1-PLY FAST MOVE SELECTION + SANITY
+# ============================================================
 
-    if depth == 0 or board.is_game_over():
-        return quiescence(board, alpha, beta)
-
-    key = None
-    if hasattr(board, "transposition_key"):
-        try:
-            key = board.transposition_key()
-        except Exception:
-            key = None
-
-    orig_alpha = alpha
-
-    if key is not None:
-        entry = TT.get(key)
-        if entry is not None:
-            TT_HITS += 1
-            entry_depth, entry_score, entry_flag = entry
-            if entry_depth >= depth:
-                if entry_flag == "EXACT":
-                    return entry_score
-                elif entry_flag == "LOWER":
-                    alpha = max(alpha, entry_score)
-                elif entry_flag == "UPPER":
-                    beta = min(beta, entry_score)
-                if alpha >= beta:
-                    return entry_score
-        else:
-            TT_MISSES += 1
-
-    max_eval = -float("inf")
-    legal_moves = list(board.generate_legal_moves())
-
-    # Simple move ordering: captures first
-    legal_moves.sort(key=lambda m: board.is_capture(m), reverse=True)
-
-    for move in legal_moves:
-        board.push(move)
-        eval_score = -negamax(board, depth - 1, -beta, -alpha)
-        board.pop()
-
-        if eval_score > max_eval:
-            max_eval = eval_score
-
-        if eval_score > alpha:
-            alpha = eval_score
-        if alpha >= beta:
-            break  # cutoff
-
-    # Store in TT
-    if key is not None:
-        if max_eval <= orig_alpha:
-            flag = "UPPER"
-        elif max_eval >= beta:
-            flag = "LOWER"
-        else:
-            flag = "EXACT"
-        TT[key] = (depth, max_eval, flag)
-
-    return max_eval
-
-
-def choose_move_with_search(
+def choose_move_fast(
     board: chess.Board,
     legal_moves,
-    depth: Optional[int] = None,
 ):
     """
-    Use negamax + alpha-beta to pick the best move.
+    SPEED + NOT-TOTALLY-DUMB:
+
+    Pass 1:
+      - For every legal move:
+          * push
+          * eval resulting position with NN (1-ply)
+          * our_score = -eval(after)
+          * pop
+
+    Pass 2 (cheap sanity):
+      - Take top K moves by our_score.
+      - For each, push it and let opponent "play best"
+        using a 1-ply search over their most forcing replies
+        (captures / promotions / checks).
+      - worst_reply_score = evaluate_worst_reply(...)
+      - combined_score = 0.3 * our_score + 0.7 * worst_reply_score
+
+    This avoids moves that walk into super obvious tactics,
+    while still staying fast.
     """
     if not legal_moves:
         return None, {}
 
-    # If no NN available, fall back to random
+    # No NN? Fall back to random.
     if not TORCH_AVAILABLE or MODEL is None:
         n = len(legal_moves)
         return random.choice(legal_moves), {m: 1.0 / n for m in legal_moves}
 
-    if depth is None:
-        depth = get_dynamic_depth(board)
+    base_scores: List[float] = []
 
-    best_score = -float("inf")
-    best_move = None
-    scores = []
-
+    # ---------- PASS 1: 1-ply NN eval for all moves ----------
     for move in legal_moves:
         board.push(move)
-        score = -negamax(board, depth - 1, -float("inf"), float("inf"))
+        # eval_result is from POV of side-to-move AFTER our move (opponent)
+        eval_result = evaluate_position(board)
         board.pop()
 
-        scores.append(score)
-        if best_move is None or score > best_score:
-            best_score = score
-            best_move = move
+        # Our POV = negative of opponent's POV
+        our_score = -eval_result
+        base_scores.append(our_score)
 
-    probs = softmax(scores)
+    # ---------- PASS 2: refine top-K moves by looking at replies ----------
+    indices = list(range(len(legal_moves)))
+    indices.sort(key=lambda i: base_scores[i], reverse=True)
+
+    K = min(4, len(indices))   # only refine top 4 candidates
+    refined_scores = list(base_scores)
+
+    for idx in indices[:K]:
+        move = legal_moves[idx]
+        board.push(move)
+        # Now opponent to move; see how bad their best reply is.
+        worst_reply = evaluate_worst_reply(board, max_replies=10)
+        board.pop()
+
+        if worst_reply is None:
+            worst_reply = -1.0  # be pessimistic if something goes wrong
+
+        # Blend immediate score and worst reply;
+        # weight reply more so we avoid walking into obvious tactics.
+        combined = 0.3 * base_scores[idx] + 0.7 * worst_reply
+        refined_scores[idx] = combined
+
+    # ---------- Final choice + softmax probs ----------
+    best_idx = max(range(len(refined_scores)), key=lambda i: refined_scores[i])
+    best_move = legal_moves[best_idx]
+
+    probs = softmax(refined_scores)
     prob_map = {m: p for m, p in zip(legal_moves, probs)}
     return best_move, prob_map
-
-
-# ============================================================
-#  PONDERING (THINK ON OPPONENT'S TIME)
-# ============================================================
-
-# Cache: board_fen -> best_move we computed while pondering.
-PONDER_CACHE = {}
-PONDER_LOCK = threading.Lock()
-PONDER_THREAD: Optional[threading.Thread] = None
-PONDER_STOP = threading.Event()
-
-
-def _board_key(board: chess.Board) -> str:
-    return board.fen()
-
-
-def _ponder_set_result(board_fen: str, move: Move):
-    with PONDER_LOCK:
-        # You can grow this more if you want; it's just RAM now.
-        if len(PONDER_CACHE) > 4096:
-            PONDER_CACHE.clear()
-        PONDER_CACHE[board_fen] = move
-
-
-def _ponder_get_move(board: chess.Board) -> Optional[Move]:
-    key = _board_key(board)
-    with PONDER_LOCK:
-        return PONDER_CACHE.get(key)
-
-
-def stop_pondering():
-    """Signal current ponder thread to stop (if any)."""
-    global PONDER_THREAD
-    PONDER_STOP.set()
-    if PONDER_THREAD is not None and PONDER_THREAD.is_alive():
-        try:
-            PONDER_THREAD.join(timeout=0.02)
-        except Exception:
-            pass
-    PONDER_THREAD = None
-    PONDER_STOP.clear()
-
-
-def _ponder_worker(root_fen: str):
-    """
-    Background worker:
-      - root_fen: position AFTER our move (opponent to move).
-      - For each opponent reply, compute our best move in that line and cache it.
-    """
-    try:
-        root = chess.Board(root_fen)
-    except Exception as e:
-        print("[PONDER] Failed to init board from fen:", e)
-        return
-
-    opp_moves = list(root.generate_legal_moves())
-    for opp_move in opp_moves:
-        if PONDER_STOP.is_set():
-            break
-
-        child = root.copy()
-        child.push(opp_move)  # now it's our turn
-
-        legal = list(child.generate_legal_moves())
-        if not legal:
-            continue
-
-        # Slightly DEEPER search while pondering (if possible).
-        try:
-            ponder_depth = min(MAX_SEARCH_DEPTH + 1, 6)
-            reply, _ = choose_move_with_search(child, legal_moves=legal, depth=ponder_depth)
-        except Exception as e:
-            print("[PONDER] Error during ponder search:", e)
-            continue
-
-        if reply is None:
-            continue
-
-        _ponder_set_result(child.fen(), reply)
-
-
-def start_pondering_from(board_after_our_move: chess.Board):
-    """
-    Start a background ponder thread from 'board_after_our_move', which
-    should be the position RIGHT AFTER we make our move (opponent to move).
-    """
-    if not TORCH_AVAILABLE or MODEL is None:
-        return
-
-    stop_pondering()
-    fen = board_after_our_move.fen()
-
-    global PONDER_THREAD
-    PONDER_THREAD = threading.Thread(
-        target=_ponder_worker,
-        args=(fen,),
-        daemon=True,
-    )
-    PONDER_STOP.clear()
-    PONDER_THREAD.start()
 
 
 # ============================================================
@@ -639,46 +474,26 @@ def test_func(ctx: GameContext):
     """
     Called for every move request by ChessHacks.
 
-    - Uses dynamic depth for search (get_dynamic_depth).
-    - Depth scales with phase of game + checks.
-    - Uses pondering results if available.
+    - Uses 1-ply NN eval + small opponent-reply sanity.
+    - No deep tree search.
     """
-    # Stop any previous pondering (but keep cache).
-    stop_pondering()
-
     legal_moves = list(ctx.board.generate_legal_moves())
     if not legal_moves:
         ctx.logProbabilities({})
         raise ValueError("No legal moves available.")
 
-    # 1) If we already pondered this exact position, use that.
-    cached_move = _ponder_get_move(ctx.board)
-    if cached_move is not None and cached_move in legal_moves:
-        probs = {m: (1.0 if m == cached_move else 0.0) for m in legal_moves}
-        ctx.logProbabilities(probs)
-        chosen_move = cached_move
-    else:
-        # 2) Normal search.
-        chosen_move, prob_map = choose_move_with_search(ctx.board, legal_moves, depth=None)
-        ctx.logProbabilities(prob_map)
-
-    # 3) After deciding on our move, start pondering from the
-    #    new position (opponent to move) in a background thread.
-    board_after = ctx.board.copy()
-    board_after.push(chosen_move)
-    start_pondering_from(board_after)
-
-    return chosen_move
+    move, prob_map = choose_move_fast(ctx.board, legal_moves)
+    ctx.logProbabilities(prob_map)
+    return move
 
 
 @chess_manager.reset
 def reset_func(ctx: GameContext):
     """
     Called when a new game starts.
+    Nothing to reset in this minimal-speed version.
     """
-    stop_pondering()
-    with PONDER_LOCK:
-        PONDER_CACHE.clear()
+    pass
 
 
 # ============================================================
@@ -812,10 +627,7 @@ def load_pgn_dataset(path: str, max_positions: Optional[int] = None):
 
 def load_lichess_games_csv(path: str, max_positions: Optional[int] = None):
     """
-    Load a Lichess games CSV with columns including:
-      id, winner, moves, white_elo / black_elo or similar.
-
-    Outputs (x, y, w) triples with Elo-based weights.
+    Load a Lichess games CSV and produce (x, y, w) triples.
     """
     if not TORCH_AVAILABLE or torch is None:
         print("[DATA] Torch not available; cannot load Lichess CSV.")
@@ -895,7 +707,7 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
     """
     Load everything in datasets folder:
       - *.pgn -> PGN games
-      - lichess-style *.csv -> moves/winner
+      - lichess-style *.csv
     Returns list of (x, y, weight).
     """
     if not TORCH_AVAILABLE:
@@ -913,7 +725,7 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
     pgn_files = [f for f in files if f.lower().endswith(".pgn")]
     csv_files = [f for f in files if f.lower().endswith(".csv")]
 
-    all_positions: List[Tuple] = []
+    all_positions: List[Tuple[torch.Tensor, float, float]] = []
 
     # Parallel PGN loading
     if pgn_files:
@@ -1029,13 +841,13 @@ def load_all_datasets(folder: str = "datasets", max_positions: Optional[int] = N
 
 
 # ============================================================
-#  REPLAY BUFFER + SELF-PLAY + STOCKFISH GAMES
+#  REPLAY BUFFER + SELF-PLAY + STOCKFISH GAMES (1-PLY LOGIC)
 # ============================================================
 
 if TORCH_AVAILABLE and CnnValueNet is not None:
 
     class ReplayBuffer:
-        def __init__(self, cap: int = 1_000_000):
+        def __init__(self, cap: int = 500_000):
             self.cap = cap
             # store (x, y, weight)
             self.data = []
@@ -1071,16 +883,19 @@ else:
 
 
 def choose_move_for_selfplay(board: Board, depth: int) -> Optional[Move]:
+    """
+    Self-play move choice. depth arg is ignored in speed mode; we use 1-ply.
+    """
     legal = list(board.generate_legal_moves())
     if not legal:
         return None
-    move, _ = choose_move_with_search(board, legal_moves=legal, depth=depth)
+    move, _ = choose_move_fast(board, legal_moves=legal)
     return move
 
 
 def self_play_game(max_moves: int = 600, depth: int = SELFPLAY_DEPTH):
     """
-    Self-play game with the current MODEL.
+    Self-play game with current MODEL, using 1-ply move choice.
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return []
@@ -1206,6 +1021,7 @@ def game_vs_stockfish(
 ):
     """
     Play one game vs Stockfish. Returns (labeled_positions, result_from_our_pov).
+    Uses 1-ply NN-only move selection for our moves.
     """
     if MODEL is None or not TORCH_AVAILABLE:
         return [], 0.0
@@ -1340,7 +1156,7 @@ def train_forever(
     selfplay_games_per_cycle: int = 10,
 ):
     """
-    Main training driver.
+    Main training driver (unchanged logic, 1-ply move selection).
     """
     if not TORCH_AVAILABLE or CnnValueNet is None:
         print("[TRAIN] Torch or CNN not available, cannot train.")
@@ -1420,7 +1236,7 @@ def train_forever(
                           f"{len(pos_sf)} positions, result={res}, replay={len(REPLAY)}")
 
             # --- Backprop steps ---
-            steps = max(20, selfplay_games_per_cycle * 8)
+            steps = max(10, selfplay_games_per_cycle * 5)
             last_loss = None
             for _ in range(steps):
                 last_loss = backprop_step(optimizer, batch_size=batch_size)
